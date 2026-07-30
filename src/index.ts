@@ -5,7 +5,7 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 
 // ===== your original target =====
-const TARGET = "http://south.ayanakojivps.shop";
+const TARGET = "https://south.ayanakojivps.shop:2053";
 
 // create proxy
 const proxy = httpProxy.createProxyServer({
