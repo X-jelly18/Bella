@@ -1,53 +1,51 @@
-import http from "http";
-import https from "https";
+import express from "express";
 import httpProxy from "http-proxy";
 
+const app = express();
 const PORT = process.env.PORT || 8080;
+
+// ===== your original target =====
 const TARGET = "https://south.ayanakojivps.shop:2053";
 
-// 1. Create a Keep-Alive agent to prevent TLS handshake overhead on every request
-const httpsAgent = new https.Agent({
-  keepAlive: true,
-  maxSockets: 100,
-  maxFreeSockets: 10,
-  timeout: 60000, 
-});
-
-// 2. Initialize proxy with the agent
+// create proxy
 const proxy = httpProxy.createProxyServer({
   target: TARGET,
   changeOrigin: true,
   ws: true,
-  xfwd: true,
-  agent: httpsAgent,
+  xfwd: true
 });
 
-// 3. Drop Express and use the native HTTP module for maximum speed
-const server = http.createServer((req, res) => {
-  proxy.web(req, res, { target: TARGET }, (err) => {
-    console.error("Proxy error:", err.message);
-    if (!res.headersSent) {
-      res.writeHead(502).end("Bad Gateway");
+// -----------------------------
+// HTTP PROXY (same as Nginx → Node in VPS script)
+// -----------------------------
+app.use((req, res) => {
+  proxy.web(
+    req,
+    res,
+    { target: TARGET },
+    (err) => {
+      console.error("Proxy error:", err);
+      if (!res.headersSent) {
+        res.status(502).send("Bad Gateway");
+      }
     }
-  });
+  );
 });
 
-// 4. Optimize WebSocket upgrades
-server.on("upgrade", (req, socket, head) => {
-  // CRITICAL: Disable Nagle's algorithm. 
-  // This forces TCP packets to send immediately instead of buffering, drastically reducing SSH keystroke lag.
-  socket.setNoDelay(true);
-  
-  // Optional: keep-alive the socket at the TCP layer
-  socket.setKeepAlive(true, 15000);
+// -----------------------------
+// WebSocket support (like nginx upgrade block)
+// -----------------------------
+const server = app.listen(Number(PORT), "0.0.0.0", () => {
+  console.log(`Cloud Run proxy running on :${PORT} → ${TARGET}`);
+});
 
+server.on("upgrade", (req, socket, head) => {
   proxy.ws(req, socket, head, { target: TARGET });
 });
 
+// -----------------------------
+// Error handling (like your proxy.on("error"))
+// -----------------------------
 proxy.on("error", (err) => {
-  console.error("Proxy internal error:", err.message);
-});
-
-server.listen(Number(PORT), "0.0.0.0", () => {
-  console.log(`High-speed Cloud Run proxy running on :${PORT} → ${TARGET}`);
+  console.error("Proxy internal error:", err);
 });
