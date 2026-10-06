@@ -32,7 +32,7 @@ ok()   { echo -e "${C_GREEN}  ✓ $*${C_RESET}"; }
 warn() { echo -e "${C_YELLOW}  ! $*${C_RESET}"; }
 die()  { echo -e "${C_RED}  ✗ $*${C_RESET}" >&2; exit 1; }
 
-say "${C_BOLD}${C_PURPLE}=== Ayanakoji tunnel stack installer ===${C_RESET}"
+say "${C_BOLD}${C_PURPLE}=== Ayanakoji SSH-over-TLS installer ===${C_RESET}"
 say "${C_DIM}  repo ${REPO} @ ${REF}${C_RESET}\n"
 
 [ "$(id -u)" -eq 0 ] || die "Run as root: pipe this into 'sudo bash', or re-run with sudo."
