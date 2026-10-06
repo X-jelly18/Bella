@@ -1,5 +1,5 @@
 #!/bin/bash
-# Ayanakoji tunnel stack installer.
+# Ayanakoji SSH-over-TLS installer.
 #
 #   curl -fsSL https://raw.githubusercontent.com/X-jelly18/Bella/main/vps/install.sh | sudo bash
 #
@@ -46,17 +46,17 @@ esac
 # ---------------------------------------------------------- dependencies ---
 
 if [ "${SKIP_DEPS:-0}" = "1" ]; then
-    warn "SKIP_DEPS=1, assuming haproxy, openssl, python3 and go are present"
+    warn "SKIP_DEPS=1, assuming openssl and go are present"
     [ -x /usr/local/go/bin/go ] && export PATH="/usr/local/go/bin:$PATH"
     command -v go > /dev/null 2>&1 || die "go not found, and SKIP_DEPS=1 was set"
 else
 say "${C_BOLD}Installing packages...${C_RESET}"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y > /tmp/ayanakoji-apt.log 2>&1 || warn "apt-get update reported errors (see /tmp/ayanakoji-apt.log)"
-if ! apt-get install -y haproxy openssl python3 curl wget unzip ca-certificates >> /tmp/ayanakoji-apt.log 2>&1; then
+if ! apt-get install -y openssl curl ca-certificates >> /tmp/ayanakoji-apt.log 2>&1; then
     die "Package install failed. See /tmp/ayanakoji-apt.log"
 fi
-ok "haproxy, openssl, python3 and tools installed"
+ok "openssl and tools installed"
 
 # The proxy uses tls.Conn.NetConn(), so a reasonably recent Go is required.
 # Distro packages are often too old, in which case the official tarball is used.
@@ -100,7 +100,7 @@ fi
 
 say "\n${C_BOLD}Fetching sources...${C_RESET}"
 mkdir -p "$INSTALL_DIR"
-for f in ayanakoji_proxy.go go.mod transport-setup.sh menu.sh ssh-manager.sh uninstall.sh; do
+for f in ayanakoji_proxy.go go.mod menu.sh ssh-manager.sh uninstall.sh; do
     if [ -n "$SRC_DIR" ] && [ -f "$SRC_DIR/$f" ]; then
         # Running from a checkout rather than piped from curl.
         cp "$SRC_DIR/$f" "$INSTALL_DIR/$f"

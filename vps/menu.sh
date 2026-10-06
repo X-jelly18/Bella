@@ -1,186 +1,207 @@
 #!/bin/bash
+# SSH-over-TLS setup and management.
 set -u
+
 C_RESET='\033[0m'; C_BOLD='\033[1m'; C_DIM='\033[2m'
 C_RED='\033[31m'; C_GREEN='\033[32m'; C_YELLOW='\033[33m'; C_CYAN='\033[36m'; C_PURPLE='\033[35m'
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="${INSTALL_DIR:-/opt/ayanakoji-proxy}"
 SERVICE_FILE="${SERVICE_FILE:-/etc/systemd/system/ayanakoji-proxy.service}"
-DUMMY_DIR="${DUMMY_DIR:-/var/www/dummy}"
-CERT_DIR="${CERT_DIR:-/etc/haproxy/certs}"
-CERT_PEM="$CERT_DIR/ayanakoji.pem"
+SERVICE_NAME="$(basename "$SERVICE_FILE" .service)"
+CERT_DIR="${CERT_DIR:-/etc/ayanakoji}"
+BIN="$INSTALL_DIR/ayanakoji_proxy"
 
 [ "$(id -u)" -eq 0 ] || { echo -e "${C_RED}Run as root (sudo menu.sh)${C_RESET}"; exit 1; }
 
-setup_all() {
-    clear; echo -e "${C_BOLD}${C_PURPLE}=== Complete Master Setup ===${C_RESET}\n"
-    read -rp "👉 Enter path for SSH Tunnel [default: /ssh]: " SSH_PATH; SSH_PATH=${SSH_PATH:-/ssh}
-    read -rp "👉 Enter path for V2Ray [default: /v2ray]: " V2RAY_PATH; V2RAY_PATH=${V2RAY_PATH:-/v2ray}
-    read -rp "👉 Enter a website to clone (e.g. example.com) [Enter for random]: " DUMMY_SITE
-
-    mkdir -p "$DUMMY_DIR"
-    if [ -z "$DUMMY_SITE" ]; then
-        SITES=("example.com" "gnu.org" "neverssl.com"); DUMMY_SITE=${SITES[$RANDOM % ${#SITES[@]}]}
+ask() {
+    local __ask_var="$1" __ask_prompt="$2" __ask_default="${3:-}" __ask_reply=""
+    if [ -n "$__ask_default" ]; then
+        read -rp "$(echo -e "👉 ${__ask_prompt} ${C_DIM}[${__ask_default}]${C_RESET}: ")" __ask_reply
+    else
+        read -rp "$(echo -e "👉 ${__ask_prompt}: ")" __ask_reply
     fi
-    wget -qO "$DUMMY_DIR/index.html" "http://$DUMMY_SITE" \
-        || echo "<h1>System Maintenance</h1>" > "$DUMMY_DIR/index.html"
+    printf -v "$__ask_var" '%s' "${__ask_reply:-$__ask_default}"
+}
 
-    cat > /etc/systemd/system/ayanakoji-dummy.service <<UNIT
-[Unit]
-Description=Ayanakoji Dummy Website
-After=network-online.target
-Wants=network-online.target
+ask_yn() {
+    local __p="$1" __d="${2:-n}" __r="" __hint
+    [ "$__d" = "y" ] && __hint="Y/n" || __hint="y/N"
+    while true; do
+        read -rp "$(echo -e "👉 ${__p} ${C_DIM}[${__hint}]${C_RESET}: ")" __r
+        case "${__r:-$__d}" in
+            y | Y | yes) return 0 ;;
+            n | N | no) return 1 ;;
+            *) echo -e "${C_RED}  ✗ Answer y or n.${C_RESET}" ;;
+        esac
+    done
+}
 
-[Service]
-User=nobody
-WorkingDirectory=$DUMMY_DIR
-ExecStart=/usr/bin/python3 -m http.server 10081 --bind 127.0.0.1
-Restart=always
-RestartSec=2
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
+valid_ports() {
+    local p
+    for p in ${1//,/ }; do
+        [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le 65535 ] || return 1
+    done
+    [ -n "$1" ]
+}
 
-[Install]
-WantedBy=multi-user.target
-UNIT
-    systemctl daemon-reload
-    systemctl enable ayanakoji-dummy --now > /dev/null 2>&1
-    echo -e "${C_GREEN}  ✓ dummy site serving $DUMMY_SITE on 127.0.0.1:10081${C_RESET}"
+make_self_signed() {
+    local cn="$1"
+    mkdir -p "$CERT_DIR"
+    # The key and certificate must go to separate files. Passing one path to
+    # both -keyout and -out makes the certificate truncate the key.
+    openssl req -x509 -newkey rsa:2048 -nodes \
+        -keyout "$CERT_DIR/key.pem" -out "$CERT_DIR/cert.pem" \
+        -days 3650 -subj "/CN=$cn" > /dev/null 2>&1 || return 1
+    chmod 600 "$CERT_DIR/key.pem"
+    chmod 644 "$CERT_DIR/cert.pem"
+    CERT="$CERT_DIR/cert.pem"
+    KEY="$CERT_DIR/key.pem"
+}
 
-    echo -e "\n${C_BOLD}Building the Go proxy...${C_RESET}"
-    cd "$SCRIPT_DIR" || return 1
-    export PATH="/usr/local/go/bin:$PATH"
-    if ! GOFLAGS=-mod=mod GOCACHE=/tmp/ayanakoji-gocache \
-        go build -ldflags "-s -w" -o "$INSTALL_DIR/ayanakoji_proxy" . ; then
-        echo -e "${C_RED}  ✗ build failed${C_RESET}"; read -rp "Press Enter..." _; return 1
+setup() {
+    clear
+    echo -e "${C_BOLD}${C_PURPLE}=== SSH over SSL/TLS — setup ===${C_RESET}"
+    echo -e "${C_DIM}Clients open a TLS connection and speak SSH inside it. No HTTP,"
+    echo -e "no websocket, no payload.${C_RESET}\n"
+
+    local PORTS SSH_HOST SSH_PORT MAX_CONNS CN
+    CERT=""; KEY=""
+
+    while true; do
+        ask PORTS "TLS port(s), comma-separated" "443"
+        valid_ports "$PORTS" && break
+        echo -e "${C_RED}  ✗ Ports must be numbers from 1 to 65535.${C_RESET}"
+    done
+
+    echo
+    echo -e "  ${C_GREEN}[1]${C_RESET} Generate a self-signed certificate ${C_DIM}(works with most tunnel clients)${C_RESET}"
+    echo -e "  ${C_GREEN}[2]${C_RESET} Use an existing certificate ${C_DIM}(Let's Encrypt, or your own)${C_RESET}"
+    echo
+    local certchoice
+    ask certchoice "Certificate" "1"
+
+    if [ "$certchoice" = "2" ]; then
+        while true; do
+            ask CERT "Certificate (fullchain) path" "/etc/letsencrypt/live/example.com/fullchain.pem"
+            ask KEY "Private key path" "/etc/letsencrypt/live/example.com/privkey.pem"
+            if [ -f "$CERT" ] && [ -f "$KEY" ]; then break; fi
+            echo -e "${C_RED}  ✗ Both files must exist. Not found:${C_RESET}"
+            [ -f "$CERT" ] || echo -e "${C_RED}      $CERT${C_RESET}"
+            [ -f "$KEY" ] || echo -e "${C_RED}      $KEY${C_RESET}"
+            ask_yn "  Try again" "y" || return 1
+        done
+    else
+        ask CN "Common name for the certificate" "$(hostname -f 2>/dev/null || hostname)"
+        if ! make_self_signed "$CN"; then
+            echo -e "${C_RED}  ✗ Could not generate the certificate.${C_RESET}"
+            read -rp "Press Enter..." _; return 1
+        fi
+        echo -e "${C_GREEN}  ✓ self-signed certificate in $CERT_DIR${C_RESET}"
     fi
-    chmod +x "$INSTALL_DIR/ayanakoji_proxy"
-    echo -e "${C_GREEN}  ✓ built${C_RESET}"
 
-    # Internal ws listener that HAProxy routes to. Extra, directly reachable
-    # ports (CONNECT, payload, direct) are added from menu option 2.
+    echo
+    ask SSH_HOST "SSH backend host" "127.0.0.1"
+    ask SSH_PORT "SSH backend port" "22"
+    MAX_CONNS="0"
+    if ask_yn "Cap concurrent tunnels" "n"; then
+        ask MAX_CONNS "Maximum concurrent tunnels" "2000"
+    fi
+
+    local args="\"-listen\" \"$PORTS\" \"-cert\" \"$CERT\" \"-key\" \"$KEY\""
+    args="$args \"-ssh-host\" \"$SSH_HOST\" \"-ssh-port\" \"$SSH_PORT\""
+    [ "$MAX_CONNS" != "0" ] && args="$args \"-max-conns\" \"$MAX_CONNS\""
+
+    echo
+    echo -e "${C_BOLD}${C_PURPLE}=== Review ===${C_RESET}\n"
+    echo -e "  ${C_BOLD}Listening:${C_RESET}  TLS on $PORTS"
+    echo -e "  ${C_BOLD}Backend:${C_RESET}    $SSH_HOST:$SSH_PORT"
+    echo -e "  ${C_BOLD}Certificate:${C_RESET} $CERT"
+    echo -e "  ${C_BOLD}Key:${C_RESET}        $KEY"
+    [ "$MAX_CONNS" != "0" ] && echo -e "  ${C_BOLD}Max tunnels:${C_RESET} $MAX_CONNS"
+    echo -e "\n  ${C_DIM}$BIN $(echo "$args" | tr -d '"')${C_RESET}\n"
+
+    ask_yn "Write the service and start it" "y" || { echo -e "\n${C_YELLOW}Nothing changed.${C_RESET}"; read -rp "Press Enter..." _; return 0; }
+
     cat > "$SERVICE_FILE" <<UNIT
 [Unit]
-Description=Ayanakoji Go Proxy Backend
+Description=Ayanakoji SSH-over-TLS proxy
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$INSTALL_DIR/ayanakoji_proxy "-host" "127.0.0.1" "-listen" "10080:auto" "-ssh-host" "127.0.0.1" "-ssh-port" "22"
+ExecStart=$BIN $args
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
+
+# The proxy only reads its certificate and opens sockets.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadOnlyPaths=$CERT_DIR
 
 [Install]
 WantedBy=multi-user.target
 UNIT
+
     systemctl daemon-reload
-    systemctl enable ayanakoji-proxy.service > /dev/null 2>&1
-    systemctl restart ayanakoji-proxy.service
-    echo -e "${C_GREEN}  ✓ ayanakoji-proxy running on 127.0.0.1:10080 (auto-detect)${C_RESET}"
-
-    echo -e "\n${C_BOLD}Configuring SSL and HAProxy...${C_RESET}"
-    mkdir -p "$CERT_DIR"
-    if [ ! -f "$CERT_PEM" ]; then
-        # The key and certificate MUST be written to separate files and then
-        # concatenated. Passing the same path to -keyout and -out makes the
-        # certificate truncate the file the key was just written to, leaving a
-        # PEM with no private key that HAProxy refuses to load.
-        openssl req -x509 -newkey rsa:2048 -nodes \
-            -keyout "$CERT_DIR/ayanakoji.key" \
-            -out "$CERT_DIR/ayanakoji.crt" \
-            -days 3650 -subj "/CN=ayanakoji" > /dev/null 2>&1
-        cat "$CERT_DIR/ayanakoji.key" "$CERT_DIR/ayanakoji.crt" > "$CERT_PEM"
-        rm -f "$CERT_DIR/ayanakoji.key" "$CERT_DIR/ayanakoji.crt"
-        chmod 600 "$CERT_PEM"
-        echo -e "${C_GREEN}  ✓ self-signed certificate at $CERT_PEM${C_RESET}"
+    systemctl enable "$SERVICE_NAME" > /dev/null 2>&1
+    if systemctl restart "$SERVICE_NAME"; then
+        echo -e "\n${C_GREEN}${C_BOLD}  ✓ $SERVICE_NAME is running.${C_RESET}"
+        local first_port="${PORTS%%,*}"
+        echo -e "\n${C_BOLD}Connect from a client:${C_RESET}"
+        echo -e "${C_DIM}  Tunnel apps: host = this server, port = $first_port, mode = SSH + SSL/TLS (direct)${C_RESET}"
+        echo -e "${C_DIM}  OpenSSH via stunnel/socat:${C_RESET}"
+        echo -e "${C_DIM}    ssh -o ProxyCommand='openssl s_client -quiet -verify_quiet -connect %h:$first_port' user@this-server${C_RESET}"
     else
-        echo -e "${C_DIM}  • keeping existing $CERT_PEM${C_RESET}"
+        echo -e "\n${C_RED}  ✗ Failed to start. journalctl -u $SERVICE_NAME -n 30${C_RESET}"
     fi
-
-    cat > /etc/haproxy/haproxy.cfg <<CFG
-global
-    log /dev/log local0
-    daemon
-    maxconn 100000
-defaults
-    mode tcp
-    option tcplog
-    log global
-    timeout connect 5s
-    timeout client  1h
-    timeout server  1h
-frontend multiplexer_443
-    bind *:443 ssl crt $CERT_PEM
-    mode tcp
-    tcp-request inspect-delay 5s
-    acl is_ssh req.payload(0,100) -m sub $SSH_PATH
-    acl is_v2ray req.payload(0,100) -m sub $V2RAY_PATH
-    tcp-request content accept if is_ssh
-    tcp-request content accept if is_v2ray
-    use_backend ssh_backend if is_ssh
-    use_backend v2ray_backend if is_v2ray
-    default_backend dummy_backend
-backend ssh_backend
-    server local_go_proxy 127.0.0.1:10080
-backend v2ray_backend
-    server local_v2ray 127.0.0.1:10086
-backend dummy_backend
-    server local_dummy 127.0.0.1:10081
-CFG
-
-    if ! haproxy -c -f /etc/haproxy/haproxy.cfg > /tmp/ayanakoji-haproxy.log 2>&1; then
-        echo -e "${C_RED}  ✗ HAProxy config is invalid:${C_RESET}"
-        sed 's/^/    /' /tmp/ayanakoji-haproxy.log
-        read -rp "Press Enter..." _; return 1
-    fi
-    systemctl enable haproxy > /dev/null 2>&1
-    systemctl restart haproxy
-    echo -e "${C_GREEN}  ✓ HAProxy listening on :443${C_RESET}"
-
-    echo -e "\n${C_BOLD}${C_GREEN}Setup complete.${C_RESET}"
-    echo -e "${C_DIM}  SSH path: $SSH_PATH    V2Ray path: $V2RAY_PATH${C_RESET}"
     echo; read -rp "Press Enter to continue..." _
 }
 
-service_status() {
-    local s
-    for s in ayanakoji-proxy ayanakoji-dummy haproxy; do
-        if systemctl is-active --quiet "$s" 2>/dev/null; then
-            echo -e "  ${C_GREEN}●${C_RESET} $s"
-        else
-            echo -e "  ${C_RED}○${C_RESET} $s ${C_DIM}(stopped)${C_RESET}"
-        fi
-    done
+status_line() {
+    if systemctl is-active --quiet "$SERVICE_NAME" 2> /dev/null; then
+        echo -e "  ${C_GREEN}●${C_RESET} $SERVICE_NAME  ${C_DIM}$(systemctl show -p ExecStart --value "$SERVICE_NAME" 2>/dev/null | grep -o '\-listen[^-]*' | head -1)${C_RESET}"
+    elif [ -f "$SERVICE_FILE" ]; then
+        echo -e "  ${C_RED}○${C_RESET} $SERVICE_NAME ${C_DIM}(configured but stopped)${C_RESET}"
+    else
+        echo -e "  ${C_YELLOW}○${C_RESET} $SERVICE_NAME ${C_DIM}(not configured — run setup)${C_RESET}"
+    fi
 }
 
 while true; do
     clear
-    echo -e "${C_BOLD}${C_PURPLE}=== Ayanakoji Master Edition ===${C_RESET}\n"
-    service_status
+    echo -e "${C_BOLD}${C_PURPLE}=== Ayanakoji — SSH over SSL/TLS ===${C_RESET}\n"
+    status_line
     echo
-    echo -e "  ${C_GREEN}[1]${C_RESET} Run Complete Master Setup"
-    echo -e "  ${C_CYAN}[2]${C_RESET} Configure transports ${C_DIM}(CONNECT / payload / direct ports)${C_RESET}"
-    echo -e "  ${C_GREEN}[3]${C_RESET} Manage SSH Users"
-    echo -e "  ${C_GREEN}[4]${C_RESET} View Proxy Logs"
-    echo -e "  ${C_GREEN}[5]${C_RESET} Restart Services"
-    echo -e "  ${C_RED}[99] FULL UNINSTALL${C_RESET}"
+    echo -e "  ${C_GREEN}[1]${C_RESET} Setup / reconfigure"
+    echo -e "  ${C_GREEN}[2]${C_RESET} Manage SSH users"
+    echo -e "  ${C_GREEN}[3]${C_RESET} View logs"
+    echo -e "  ${C_GREEN}[4]${C_RESET} Restart service"
+    echo -e "  ${C_CYAN}[5]${C_RESET} Show certificate details"
+    echo -e "  ${C_RED}[99] Uninstall${C_RESET}"
     echo -e "  ${C_YELLOW}[0]${C_RESET} Exit"
     echo
-    read -rp "👉 Choice: " choice
+    read -rp "$(echo -e "👉 Choice: ")" choice
     case "$choice" in
-        1) setup_all ;;
-        2) bash "$SCRIPT_DIR/transport-setup.sh" ;;
-        3) bash "$SCRIPT_DIR/ssh-manager.sh" ;;
-        4) journalctl -u ayanakoji-proxy -n 50 -f ;;
-        5) systemctl restart ayanakoji-proxy ayanakoji-dummy haproxy 2>&1 | sed 's/^/  /'
-           echo -e "${C_GREEN}  ✓ restarted${C_RESET}"; read -rp "Press Enter..." _ ;;
+        1) setup ;;
+        2) bash "$SCRIPT_DIR/ssh-manager.sh" ;;
+        3) journalctl -u "$SERVICE_NAME" -n 50 -f ;;
+        4) systemctl restart "$SERVICE_NAME" && echo -e "${C_GREEN}  ✓ restarted${C_RESET}" \
+               || echo -e "${C_RED}  ✗ failed${C_RESET}"; read -rp "Press Enter..." _ ;;
+        5) echo
+           if [ -f "$CERT_DIR/cert.pem" ]; then
+               openssl x509 -in "$CERT_DIR/cert.pem" -noout -subject -issuer -dates 2>&1 | sed 's/^/  /'
+           else
+               echo -e "  ${C_DIM}No certificate at $CERT_DIR/cert.pem${C_RESET}"
+           fi
+           echo; read -rp "Press Enter..." _ ;;
         99) bash "$SCRIPT_DIR/uninstall.sh"; exit 0 ;;
         0) exit 0 ;;
         *) sleep 1 ;;
