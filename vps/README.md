@@ -171,6 +171,11 @@ Two caveats:
 These apply when the client sends its payload **to us**. If the payload goes to
 the client's own proxy instead, none of these matter.
 
+The default reply is `200 <font color='red'>@Official_Kiyotaka</font>`, which
+tunnel clients render coloured in their connection log. `-connect-status` sets
+the same banner for CONNECT clients. Both reject CR and LF so a status line
+cannot smuggle in extra headers.
+
 `-payload-status` sets the reply (`200 OK` by default; empty replies nothing).
 `-payload-match` requires a substring in the request head, which quietly drops
 port scanners.
@@ -188,7 +193,8 @@ as protocol garbage and the connection fails.
 -ssh-host, -ssh-port     backend (default 127.0.0.1:22)
 -connect-timeout-secs    backend dial timeout (default 5)
 -handshake-timeout-secs  per-client handshake budget (default 10)
--payload-status          payload reply status line (default "200 OK")
+-payload-status          payload reply banner (default "200 <font color='red'>@Official_Kiyotaka</font>")
+-connect-status          CONNECT reply banner (same default)
 -payload-match           required substring in a payload request head
 -path                    comma-separated paths a payload request must target
 -payload-extra-heads     extra request blocks to consume (default 0)

@@ -40,6 +40,11 @@ import (
 )
 
 const (
+	defaultPayloadStatus = "200 <font color='red'>@Official_Kiyotaka</font>"
+	defaultConnectStatus = "200 <font color='red'>@Official_Kiyotaka</font>"
+)
+
+const (
 	// Relay buffer, and the bufio reader size, so a request head up to
 	// maxHeaderBytes always fits without the reader reporting ErrBufferFull.
 	relayBufferSize = 16 << 10
@@ -77,6 +82,7 @@ type config struct {
 	connectTimeout   time.Duration
 	handshakeTimeout time.Duration
 	payloadResponse  []byte
+	connectResponse  []byte
 	payloadMatch     string
 	paths            []string
 	extraHeads       int
@@ -107,8 +113,10 @@ func main() {
 	maxConnsArg := flag.Int("max-conns", 0, "Maximum concurrent tunnels (0 = unlimited)")
 	shutdownGraceArg := flag.Int("shutdown-grace-secs", 10, "Seconds to let tunnels drain on SIGTERM")
 
-	payloadStatusArg := flag.String("payload-status", "200 OK",
+	payloadStatusArg := flag.String("payload-status", defaultPayloadStatus,
 		"Status line returned to payload clients (empty = reply with nothing)")
+	connectStatusArg := flag.String("connect-status", defaultConnectStatus,
+		"Status line returned to HTTP CONNECT clients")
 	payloadMatchArg := flag.String("payload-match", "",
 		"If set, a payload client's request head must contain this substring")
 	extraHeadsArg := flag.Int("payload-extra-heads", 0,
@@ -126,6 +134,13 @@ func main() {
 	payloadResponse, err := buildResponse(*payloadStatusArg)
 	if err != nil {
 		log.Fatalf("invalid -payload-status: %v", err)
+	}
+	connectResponse, err := buildResponse(*connectStatusArg)
+	if err != nil {
+		log.Fatalf("invalid -connect-status: %v", err)
+	}
+	if len(connectResponse) == 0 {
+		log.Fatal("-connect-status must not be empty")
 	}
 	if *extraHeadsArg < 0 || *extraHeadsArg > 8 {
 		log.Fatal("-payload-extra-heads must be between 0 and 8")
@@ -158,6 +173,7 @@ func main() {
 		connectTimeout:   time.Duration(*connTimeoutArg) * time.Second,
 		handshakeTimeout: time.Duration(*handshakeTimeoutArg) * time.Second,
 		payloadResponse:  payloadResponse,
+		connectResponse:  connectResponse,
 		payloadMatch:     *payloadMatchArg,
 		paths:            paths,
 		extraHeads:       *extraHeadsArg,
@@ -483,7 +499,7 @@ func handshake(client net.Conn, reader *bufio.Reader, m mode, cfg *config) error
 		return nil
 
 	case modeConnect:
-		return handshakeConnect(client, reader)
+		return handshakeConnect(client, reader, cfg.connectResponse)
 
 	case modePayload:
 		head, err := readRequestHead(reader)
@@ -561,7 +577,7 @@ func hasFoldPrefix(b []byte, prefix string) bool {
 // The host:port the client asks for is deliberately ignored: every tunnel is
 // relayed to the configured SSH backend. Honouring arbitrary targets would turn
 // this into an open relay and get the server's address blocklisted.
-func handshakeConnect(client net.Conn, reader *bufio.Reader) error {
+func handshakeConnect(client net.Conn, reader *bufio.Reader, response []byte) error {
 	head, err := readRequestHead(reader)
 	if err != nil {
 		return fmt.Errorf("reading CONNECT request: %w", err)
@@ -580,7 +596,7 @@ func handshakeConnect(client net.Conn, reader *bufio.Reader) error {
 	}
 
 	drainBufferedNewlines(reader)
-	_, err = client.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
+	_, err = client.Write(response)
 	return err
 }
 

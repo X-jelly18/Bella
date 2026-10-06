@@ -42,7 +42,8 @@ ask_yn() {
 
 L_PORT=(); L_MODE=(); L_TLS=()
 CERT=""; KEY=""
-PAYLOAD_STATUS="200 OK"; PAYLOAD_MATCH=""; EXTRA_HEADS="0"; TUNNEL_PATH=""
+DEFAULT_STATUS="200 <font color='red'>@Official_Kiyotaka</font>"
+PAYLOAD_STATUS="$DEFAULT_STATUS"; PAYLOAD_MATCH=""; EXTRA_HEADS="0"; TUNNEL_PATH=""
 PAYLOAD_ASKED=0
 SSH_HOST="127.0.0.1"; SSH_PORT="22"; MAX_CONNS="0"
 
@@ -94,7 +95,7 @@ ask_payload_options() {
     # Asked as a yes/no because an empty answer to `ask` takes the default, so
     # a blank status line would otherwise be unreachable.
     if ask_yn "Reply to payload clients with a status line" "y"; then
-        ask PAYLOAD_STATUS "Status line" "200 OK"
+        ask PAYLOAD_STATUS "Status line" "$DEFAULT_STATUS"
     else
         PAYLOAD_STATUS=""
         echo -e "${C_GREEN}  ✓ payload clients get no reply at all${C_RESET}"
@@ -286,7 +287,7 @@ client_hints() {
 
 setup() {
     L_PORT=(); L_MODE=(); L_TLS=(); CERT=""; KEY=""; PAYLOAD_ASKED=0
-    PAYLOAD_STATUS="200 OK"; PAYLOAD_MATCH=""; EXTRA_HEADS="0"; MAX_CONNS="0"; TUNNEL_PATH=""
+    PAYLOAD_STATUS="$DEFAULT_STATUS"; PAYLOAD_MATCH=""; EXTRA_HEADS="0"; MAX_CONNS="0"; TUNNEL_PATH=""
 
     while true; do
         clear
