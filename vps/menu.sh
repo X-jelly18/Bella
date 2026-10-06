@@ -42,7 +42,7 @@ ask_yn() {
 
 L_PORT=(); L_MODE=(); L_TLS=()
 CERT=""; KEY=""
-PAYLOAD_STATUS="200 OK"; PAYLOAD_MATCH=""; EXTRA_HEADS="0"
+PAYLOAD_STATUS="200 OK"; PAYLOAD_MATCH=""; EXTRA_HEADS="0"; TUNNEL_PATH=""
 PAYLOAD_ASKED=0
 SSH_HOST="127.0.0.1"; SSH_PORT="22"; MAX_CONNS="0"
 
@@ -81,6 +81,16 @@ ask_port() {
 ask_payload_options() {
     [ "$PAYLOAD_ASKED" = "1" ] && return 0
     PAYLOAD_ASKED=1
+    if ask_yn "Require a path in the client's request (like /ssh)" "y"; then
+        while true; do
+            ask TUNNEL_PATH "Path" "/ssh"
+            case "$TUNNEL_PATH" in
+                /*) break ;;
+                *) echo -e "${C_RED}  ✗ A path must start with /${C_RESET}" ;;
+            esac
+        done
+        echo -e "${C_DIM}    Requests to any other path get 404 Not Found.${C_RESET}"
+    fi
     # Asked as a yes/no because an empty answer to `ask` takes the default, so
     # a blank status line would otherwise be unreachable.
     if ask_yn "Reply to payload clients with a status line" "y"; then
@@ -106,7 +116,10 @@ add_listener() {
                 echo -e "  ${C_DIM}the payload and CONNECT, and only TLS reaches us.${C_RESET}" ;;
         connect) echo -e "  ${C_DIM}The client points its app at US as the HTTP proxy and sends CONNECT here.${C_RESET}" ;;
         payload) echo -e "  ${C_DIM}The client sends its payload straight to US, with no proxy in between.${C_RESET}" ;;
-        auto) echo -e "  ${C_DIM}Sniffs the first bytes: CONNECT, a payload, or raw SSH.${C_RESET}" ;;
+        auto) echo -e "  ${C_DIM}Sniffs the first bytes: CONNECT, a payload, or raw SSH.${C_RESET}"
+              echo -e "  ${C_YELLOW}  Note: a required path only gates payload requests. CONNECT and raw${C_RESET}"
+              echo -e "  ${C_YELLOW}  SSH carry no path, so they reach the tunnel regardless. Use${C_RESET}"
+              echo -e "  ${C_YELLOW}  \"Payload sent to us\" if the path must be mandatory.${C_RESET}" ;;
     esac
 
     ask_port port "$default_port"
@@ -189,6 +202,7 @@ build_args() {
     [ -n "$CERT" ] && out+=(-cert "$CERT" -key "$KEY")
     if needs_payload; then
         out+=(-payload-status "$PAYLOAD_STATUS")
+        [ -n "$TUNNEL_PATH" ] && out+=(-path "$TUNNEL_PATH")
         [ -n "$PAYLOAD_MATCH" ] && out+=(-payload-match "$PAYLOAD_MATCH")
         [ "$EXTRA_HEADS" != "0" ] && out+=(-payload-extra-heads "$EXTRA_HEADS")
     fi
@@ -264,7 +278,7 @@ client_hints() {
         case "${L_MODE[i]}" in
             direct)  echo -e "  ${C_DIM}port ${L_PORT[i]}: mode \"SSH${tlsnote:- direct}\" — put your payload/proxy in the client${C_RESET}" ;;
             connect) echo -e "  ${C_DIM}port ${L_PORT[i]}: HTTP proxy = this host:${L_PORT[i]}${tlsnote}${C_RESET}" ;;
-            payload) echo -e "  ${C_DIM}port ${L_PORT[i]}: send your payload to this host:${L_PORT[i]}${tlsnote}${C_RESET}" ;;
+            payload) echo -e "  ${C_DIM}port ${L_PORT[i]}: send your payload to this host:${L_PORT[i]}${tlsnote}${TUNNEL_PATH:+, path $TUNNEL_PATH}${C_RESET}" ;;
             auto)    echo -e "  ${C_DIM}port ${L_PORT[i]}: payload, HTTP proxy or plain SSH all work${tlsnote}${C_RESET}" ;;
         esac
     done
@@ -272,7 +286,7 @@ client_hints() {
 
 setup() {
     L_PORT=(); L_MODE=(); L_TLS=(); CERT=""; KEY=""; PAYLOAD_ASKED=0
-    PAYLOAD_STATUS="200 OK"; PAYLOAD_MATCH=""; EXTRA_HEADS="0"; MAX_CONNS="0"
+    PAYLOAD_STATUS="200 OK"; PAYLOAD_MATCH=""; EXTRA_HEADS="0"; MAX_CONNS="0"; TUNNEL_PATH=""
 
     while true; do
         clear
@@ -336,6 +350,7 @@ setup() {
     [ -n "$CERT" ] && echo -e "  ${C_BOLD}Cert:${C_RESET}     $CERT"
     [ -n "$CERT" ] && echo -e "  ${C_BOLD}Key:${C_RESET}      $KEY"
     needs_payload && echo -e "  ${C_BOLD}Payload:${C_RESET}  reply \"${PAYLOAD_STATUS:-(nothing)}\"${PAYLOAD_MATCH:+, must contain \"$PAYLOAD_MATCH\"}"
+    [ -n "$TUNNEL_PATH" ] && echo -e "  ${C_BOLD}Path:${C_RESET}     $TUNNEL_PATH ${C_DIM}(anything else gets 404)${C_RESET}"
     echo -e "\n  ${C_BOLD}Command:${C_RESET}"
     printf "${C_DIM}    %s" "$BIN"
     for a in "${args[@]}"; do

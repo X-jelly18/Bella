@@ -45,6 +45,10 @@ the handshake server-side. Each port is configured independently:
 | `payload` | any HTTP request head | configurable status line, or nothing |
 | `auto` | any of the above | sniffs the first bytes and matches |
 
+A **path** can be required on `payload` and `auto` ports with `-path /ssh`,
+reproducing what the old HAProxy frontend matched on. Requests to any other path
+get `404 Not Found`, so a scanner sees an ordinary web server.
+
 Adding `:tls` terminates TLS on that port and runs the handshake **inside** the
 TLS session, which is what clients offer as *SSL + payload* and *SSL + proxy*:
 
@@ -135,6 +139,33 @@ ssh -o ProxyCommand='socat - PROXY:their-proxy:your-server:443,proxyport=8080' u
 ssh -o ProxyCommand='socat - PROXY:your-server:127.0.0.1:22,proxyport=8888' user@your-server
 ```
 
+### Custom TLS port and path
+
+A TLS listener on a port of your choosing, gated on a path:
+
+```sh
+ayanakoji_proxy -listen 8443:payload:tls -path /ayanakoji \
+    -cert /etc/ayanakoji/cert.pem -key /etc/ayanakoji/key.pem
+```
+
+The client then connects with TLS to port 8443 and sends a payload whose request
+line targets `/ayanakoji`. The menu asks for both under option **[3]**.
+
+Path matching accepts the path itself and anything below it, so `/ayanakoji`
+also allows `/ayanakoji/token123`, which is what clients appending a token or
+cache-buster send. A query string is ignored, and the absolute form
+(`GET http://host/ayanakoji HTTP/1.1`) that proxied clients send is understood.
+`/ayanakojiXX` and `/other/ayanakoji` are **not** accepted.
+
+Two caveats:
+
+* On an `auto` port the path only gates payload requests. `CONNECT` and raw SSH
+  carry no path and reach the tunnel regardless, so use a `payload` port if the
+  path must be mandatory.
+* A custom port is only reachable through an intermediate proxy if that proxy
+  permits `CONNECT` to it. Most allow 443 only. If clients come via their own
+  proxy, keep a TLS listener on 443.
+
 ### Payload notes (only for `payload` / `auto` ports)
 
 These apply when the client sends its payload **to us**. If the payload goes to
@@ -159,6 +190,7 @@ as protocol garbage and the connection fails.
 -handshake-timeout-secs  per-client handshake budget (default 10)
 -payload-status          payload reply status line (default "200 OK")
 -payload-match           required substring in a payload request head
+-path                    comma-separated paths a payload request must target
 -payload-extra-heads     extra request blocks to consume (default 0)
 -max-conns               concurrent tunnel cap (0 = unlimited)
 -shutdown-grace-secs     drain window on SIGTERM (default 10)

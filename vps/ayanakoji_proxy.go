@@ -78,6 +78,7 @@ type config struct {
 	handshakeTimeout time.Duration
 	payloadResponse  []byte
 	payloadMatch     string
+	paths            []string
 	extraHeads       int
 }
 
@@ -112,6 +113,8 @@ func main() {
 		"If set, a payload client's request head must contain this substring")
 	extraHeadsArg := flag.Int("payload-extra-heads", 0,
 		"Extra request heads to consume after the first, for clients that send a split payload")
+	pathArg := flag.String("path", "",
+		"Comma-separated paths a payload request must target (e.g. /ssh); empty accepts any")
 
 	flag.Parse()
 
@@ -145,12 +148,18 @@ func main() {
 		}
 	}
 
+	paths, err := parsePaths(*pathArg)
+	if err != nil {
+		log.Fatalf("invalid -path: %v", err)
+	}
+
 	cfg := &config{
 		backend:          net.JoinHostPort(*sshHostArg, *sshPortArg),
 		connectTimeout:   time.Duration(*connTimeoutArg) * time.Second,
 		handshakeTimeout: time.Duration(*handshakeTimeoutArg) * time.Second,
 		payloadResponse:  payloadResponse,
 		payloadMatch:     *payloadMatchArg,
+		paths:            paths,
 		extraHeads:       *extraHeadsArg,
 	}
 
@@ -274,6 +283,62 @@ func buildResponse(status string) ([]byte, error) {
 		return nil, errors.New("status line must not contain CR or LF")
 	}
 	return []byte("HTTP/1.1 " + status + "\r\n\r\n"), nil
+}
+
+// parsePaths validates the -path list. Each entry must be absolute so it can be
+// compared against a request target without guessing.
+func parsePaths(list string) ([]string, error) {
+	var out []string
+	for _, raw := range strings.Split(list, ",") {
+		path := strings.TrimSpace(raw)
+		if path == "" {
+			continue
+		}
+		if !strings.HasPrefix(path, "/") {
+			return nil, fmt.Errorf("path %q must start with /", path)
+		}
+		out = append(out, path)
+	}
+	return out, nil
+}
+
+// requestPath extracts the target from an HTTP request line, tolerating the
+// absolute form ("GET http://host/ssh HTTP/1.1") that proxied clients send, and
+// dropping any query or fragment.
+func requestPath(requestLine string) string {
+	fields := strings.Fields(requestLine)
+	if len(fields) < 2 {
+		return ""
+	}
+	target := fields[1]
+
+	if i := strings.Index(target, "://"); i >= 0 {
+		rest := target[i+3:]
+		if j := strings.IndexByte(rest, '/'); j >= 0 {
+			target = rest[j:]
+		} else {
+			target = "/"
+		}
+	}
+	if i := strings.IndexAny(target, "?#"); i >= 0 {
+		target = target[:i]
+	}
+	return target
+}
+
+// pathAllowed reports whether the request targets one of the configured paths.
+// A configured path matches itself and anything below it, so /ssh also accepts
+// /ssh/anything, which is what clients appending a token or cache-buster send.
+func pathAllowed(paths []string, target string) bool {
+	if len(paths) == 0 {
+		return true
+	}
+	for _, p := range paths {
+		if target == p || strings.HasPrefix(target, strings.TrimSuffix(p, "/")+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 func anyTLS(listeners []listener) bool {
@@ -427,6 +492,19 @@ func handshake(client net.Conn, reader *bufio.Reader, m mode, cfg *config) error
 		}
 		if cfg.payloadMatch != "" && !strings.Contains(head, cfg.payloadMatch) {
 			return fmt.Errorf("request head does not contain %q", cfg.payloadMatch)
+		}
+		if len(cfg.paths) > 0 {
+			requestLine := head
+			if i := strings.IndexByte(head, '\n'); i >= 0 {
+				requestLine = head[:i]
+			}
+			target := requestPath(strings.TrimRight(requestLine, "\r\n"))
+			if !pathAllowed(cfg.paths, target) {
+				// 404 rather than a bare close, so a scanner sees an ordinary
+				// web server instead of something that looks like a tunnel.
+				_, _ = client.Write([]byte("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+				return fmt.Errorf("path %q is not allowed", target)
+			}
 		}
 		// Clients that split their payload into several request blocks need the
 		// extras consumed, or sshd would receive them as protocol garbage.
