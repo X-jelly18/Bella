@@ -108,7 +108,7 @@ ask_payload_options() {
 }
 
 add_listener() {
-    local m="$1" default_port="$2" force_tls="$3" port tls=0
+    local m="$1" default_port="$2" force_tls="$3" tls_default="${4:-n}" port tls=0
     echo -e "\n${C_BOLD}${C_CYAN}$(mode_label "$m")${C_RESET}"
     case "$m" in
         direct) echo -e "  ${C_DIM}The client opens TLS and speaks SSH inside it. This is the mode that works${C_RESET}"
@@ -127,7 +127,7 @@ add_listener() {
     if [ "$force_tls" = "1" ]; then
         tls=1
         echo -e "  ${C_DIM}TLS: yes (this mode is TLS by definition)${C_RESET}"
-    elif ask_yn "Wrap this port in SSL/TLS" "n"; then
+    elif ask_yn "Wrap this port in SSL/TLS" "$tls_default"; then
         tls=1
     fi
 
@@ -297,7 +297,7 @@ setup() {
         echo -e "${C_DIM}  to its own proxy, that proxy eats it and we only ever see TLS -> pick [1].${C_RESET}\n"
         echo -e "  ${C_GREEN}[1]${C_RESET} SSH + SSL/TLS ${C_DIM}— works behind the client's own proxy/payload (usual choice)${C_RESET}"
         echo -e "  ${C_GREEN}[2]${C_RESET} We act as the HTTP proxy ${C_DIM}— client sends CONNECT to us${C_RESET}"
-        echo -e "  ${C_GREEN}[3]${C_RESET} Payload sent to us ${C_DIM}— no proxy in between${C_RESET}"
+        echo -e "  ${C_GREEN}[3]${C_RESET} Payload sent to us ${C_DIM}— asks for a TLS port and a path${C_RESET}"
         echo -e "  ${C_GREEN}[4]${C_RESET} Accept any of the above ${C_DIM}(auto-detect)${C_RESET}"
         echo
         echo -e "  ${C_CYAN}[p]${C_RESET} Preset: TLS on 443 only ${C_DIM}(for clients using their own proxy)${C_RESET}"
@@ -312,9 +312,9 @@ setup() {
             || { echo -e "\n${C_YELLOW}Input ended, nothing changed.${C_RESET}"; return 0; }
         case "${choice,,}" in
             1) add_listener direct 443 1 ;;
-            2) add_listener connect 8888 0 ;;
-            3) add_listener payload 2053 0 ;;
-            4) add_listener auto 8443 0 ;;
+            2) add_listener connect 8888 0 n ;;
+            3) add_listener payload 443 0 y ;;
+            4) add_listener auto 443 0 y ;;
             p) L_PORT=(443); L_MODE=(direct); L_TLS=(1)
                choose_certificate \
                    && echo -e "${C_GREEN}  ✓ preset loaded: SSH + SSL/TLS on 443${C_RESET}" ;;
