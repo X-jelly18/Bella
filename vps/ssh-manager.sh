@@ -80,7 +80,7 @@ while true; do
     echo -e "  ${C_GREEN}[3]${C_RESET} List users"
     echo -e "  ${C_YELLOW}[4]${C_RESET} Back to main menu"
     echo
-    read -rp "👉 Choice: " choice
+    read -rp "👉 Choice: " choice || exit 0
     case "$choice" in
         1) echo; create_user; echo; read -rp "Press Enter..." _ ;;
         2) echo; delete_user; echo; read -rp "Press Enter..." _ ;;

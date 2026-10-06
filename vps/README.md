@@ -1,11 +1,28 @@
-# Ayanakoji — SSH over SSL/TLS
+# Ayanakoji SSH tunnel
 
-Direct SSH inside TLS for a Debian or Ubuntu VPS. A client opens a TLS
-connection to the server and speaks SSH inside it immediately.
+SSH tunnelling for a Debian or Ubuntu VPS. One Go proxy accepts tunnel clients,
+completes whatever handshake they expect, and relays the stream to local sshd.
 
-There is no HTTP request, no websocket upgrade and no payload: TLS is the only
-wrapper, so to anything watching the connection it is an ordinary TLS session on
-whichever port you choose.
+Each port is configured independently, so one server can serve several client
+types at once:
+
+| Mode | Client sends | Server replies |
+|---|---|---|
+| `direct` | nothing — raw SSH straight away | nothing |
+| `connect` | `CONNECT host:port HTTP/1.1` | `200 Connection established` |
+| `payload` | any HTTP request head | configurable status line, or nothing |
+| `auto` | any of the above | sniffs the first bytes and matches |
+
+Adding `:tls` terminates TLS on that port, and the handshake then happens
+**inside** the TLS session. That composition is what tunnel clients call
+*SSL + payload* or *SSL + proxy*:
+
+```
+443:direct:tls    SSH + SSL/TLS
+8888:connect      HTTP proxy
+2053:payload      payload over plain TCP
+8443:auto:tls     payload, proxy or raw SSH, all inside TLS
+```
 
 ## Install
 
@@ -25,8 +42,6 @@ less install.sh
 sudo bash install.sh
 ```
 
-### Installer options
-
 | Variable | Effect |
 |---|---|
 | `REF` | branch, tag or commit to install from (default `main`) |
@@ -44,73 +59,78 @@ fetched into `/usr/local/go`.
 sudo /opt/ayanakoji-proxy/menu.sh
 ```
 
-Option **[1]** asks for the TLS port (default 443), whether to generate a
-self-signed certificate or use an existing one, and the SSH backend, then writes
-and starts the systemd service.
+Option **[1]** builds the listener list through prompts — pick a mode, give it a
+port, say whether to wrap it in TLS — then asks for the certificate and SSH
+backend, shows the resulting command, and writes the systemd unit. `[p]` loads a
+preset of TLS on 443, proxy on 8888 and payload on 2053.
 
-* **Self-signed** works with tunnel clients that skip verification, which is
-  most of them.
-* **Existing certificate** takes a Let's Encrypt `fullchain.pem` / `privkey.pem`
-  pair, for clients that do verify. Certbot renewal needs a reload hook:
+Certificates are either generated self-signed (most tunnel clients skip
+verification) or taken from an existing pair. Certbot renewal needs a hook:
 
-  ```sh
-  echo 'systemctl restart ayanakoji-proxy' | sudo tee /etc/letsencrypt/renewal-hooks/deploy/ayanakoji.sh
-  sudo chmod +x /etc/letsencrypt/renewal-hooks/deploy/ayanakoji.sh
-  ```
-
-The other options manage SSH users, tail logs, restart the service, show the
-certificate, and uninstall.
+```sh
+echo 'systemctl restart ayanakoji-proxy' | sudo tee /etc/letsencrypt/renewal-hooks/deploy/ayanakoji.sh
+sudo chmod +x /etc/letsencrypt/renewal-hooks/deploy/ayanakoji.sh
+```
 
 ## Connecting
 
-In a tunnel app: host is the server, port is what you chose, mode is **SSH +
-SSL/TLS** (sometimes called *direct SSL* or *stunnel*). No payload or custom
-host field is used.
+In a tunnel app, pick the mode matching the port:
 
-From OpenSSH, wrapping the connection in TLS yourself:
+* **SSH + SSL/TLS** → a `direct:tls` port
+* **SSH + Payload** → a `payload` port, with your payload in the client
+* **SSH + HTTP Proxy** → a `connect` port as the client's proxy host and port
+* **SSL + payload / SSL + proxy** → an `auto:tls` port
+
+From OpenSSH against a `direct:tls` port:
 
 ```sh
 ssh -o ProxyCommand='openssl s_client -quiet -verify_quiet -connect %h:443' user@your-server
 ```
 
-Or with stunnel on the client, pointing a local port at the server's TLS port
-and then `ssh -p <local-port> user@127.0.0.1`.
+Against a `connect` port, using an HTTP proxy directly:
 
-## How it works
-
-```
-client ──TLS──> ayanakoji_proxy :443 ──plain TCP──> sshd 127.0.0.1:22
+```sh
+ssh -o ProxyCommand='socat - PROXY:your-server:127.0.0.1:22,proxyport=8888' user@your-server
 ```
 
-The proxy terminates TLS, dials sshd, and copies bytes in both directions. It
-never parses or rewrites the stream.
+### Payload notes
+
+`-payload-status` sets the reply (`200 OK` by default; empty replies nothing).
+`-payload-match` requires a substring in the request head, which quietly drops
+port scanners.
+
+If your client sends a **split payload** — two request blocks rather than one —
+set `-payload-extra-heads 1`. Without it the second block is forwarded to sshd
+as protocol garbage and the connection fails.
 
 ## Proxy flags
 
 ```
--listen                  comma-separated TLS ports (default 443)
--cert, -key              TLS certificate chain and private key (required)
+-listen                  PORTS:MODE[:tls], repeatable (default 443:direct:tls)
+-cert, -key              certificate chain and key, required by any :tls listener
 -host                    bind address (default 0.0.0.0)
 -ssh-host, -ssh-port     backend (default 127.0.0.1:22)
 -connect-timeout-secs    backend dial timeout (default 5)
--handshake-timeout-secs  TLS handshake budget per client (default 10)
+-handshake-timeout-secs  per-client handshake budget (default 10)
+-payload-status          payload reply status line (default "200 OK")
+-payload-match           required substring in a payload request head
+-payload-extra-heads     extra request blocks to consume (default 0)
 -max-conns               concurrent tunnel cap (0 = unlimited)
 -shutdown-grace-secs     drain window on SIGTERM (default 10)
 ```
 
-TLS 1.2 is the floor; older clients are refused.
+A bare port list (`-listen 443`) means `direct:tls`, so units written for the
+TLS-only version keep working. TLS 1.2 is the floor.
+
+In `connect` mode the host:port the client asks for is **ignored** — every
+tunnel goes to the configured SSH backend. Honouring arbitrary targets would
+make this an open relay and get the server's address blocklisted.
 
 ## Hardening worth doing
 
-Once tunnels work, sshd no longer needs to be reachable from the internet. Bind
-it to localhost in `/etc/ssh/sshd_config`:
-
-```
-ListenAddress 127.0.0.1
-```
-
-and drop inbound port 22 at the firewall. The proxy reaches sshd over loopback,
-so tunnel clients are unaffected while direct SSH scanning stops.
+Once tunnels work, sshd no longer needs to be reachable from the internet. Set
+`ListenAddress 127.0.0.1` in `/etc/ssh/sshd_config` and drop inbound 22 at the
+firewall; the proxy reaches sshd over loopback, so clients are unaffected.
 
 Tunnel accounts created from the menu get `/usr/sbin/nologin` and an expiry
 date, so a leaked password grants a tunnel rather than a shell.

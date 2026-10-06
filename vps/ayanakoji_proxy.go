@@ -1,13 +1,27 @@
-// Command ayanakoji_proxy terminates TLS on one or more ports and relays each
-// connection, byte for byte, to a local SSH server.
+// Command ayanakoji_proxy accepts tunnel clients and relays them to a local SSH
+// server, completing whatever handshake the client expects first.
 //
-// There is no HTTP, websocket or CONNECT handshake: a client opens a TLS
-// connection and speaks SSH inside it immediately. That is the whole protocol.
+// Each port is configured independently with -listen PORTS:MODE[:tls]:
 //
-//	ayanakoji_proxy -listen 443 -cert /path/cert.pem -key /path/key.pem
+//	direct   no handshake, relay the stream straight away
+//	connect  HTTP CONNECT, reply "HTTP/1.1 200 Connection established"
+//	payload  read the client's request head, reply a configurable status line
+//	auto     sniff the first bytes and pick connect, direct or payload
+//
+// Appending :tls terminates TLS on that port, and the handshake above then
+// happens inside the TLS session. That composition is what tunnel clients call
+// "SSL + payload" or "SSL + proxy":
+//
+//	ayanakoji_proxy -listen 443:direct:tls -listen 8443:auto:tls \
+//	    -listen 8888:connect -listen 2053:payload \
+//	    -cert cert.pem -key key.pem
+//
+// A bare port list (-listen 443) means direct over TLS, so units written for
+// the TLS-only version keep working.
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -25,50 +39,119 @@ import (
 	"time"
 )
 
-// Relay buffer size. io.CopyBuffer prefers the kernel fast path on TCP
-// connections and falls back to this.
-const relayBufferSize = 16 << 10
+const (
+	// Relay buffer, and the bufio reader size, so a request head up to
+	// maxHeaderBytes always fits without the reader reporting ErrBufferFull.
+	relayBufferSize = 16 << 10
+
+	// Bounds on the client handshake. Without these a peer can hold a
+	// connection open while the server buffers an unbounded request head.
+	maxHeaderBytes = 8 << 10
+	maxHeaderLines = 100
+)
+
+type mode string
+
+const (
+	modeDirect  mode = "direct"
+	modeConnect mode = "connect"
+	modePayload mode = "payload"
+	modeAuto    mode = "auto"
+)
+
+type listener struct {
+	port   string
+	mode   mode
+	useTLS bool
+}
+
+func (l listener) String() string {
+	if l.useTLS {
+		return fmt.Sprintf(":%s %s over tls", l.port, l.mode)
+	}
+	return fmt.Sprintf(":%s %s", l.port, l.mode)
+}
+
+type config struct {
+	backend          string
+	connectTimeout   time.Duration
+	handshakeTimeout time.Duration
+	payloadResponse  []byte
+	payloadMatch     string
+	extraHeads       int
+}
+
+type repeatedFlag []string
+
+func (f *repeatedFlag) String() string { return strings.Join(*f, " ") }
+
+func (f *repeatedFlag) Set(v string) error {
+	*f = append(*f, v)
+	return nil
+}
 
 func main() {
 	log.SetFlags(log.LstdFlags)
 
-	portsArg := flag.String("listen", "443", "Comma-separated TLS ports to accept SSH on")
+	var listenArgs repeatedFlag
+	flag.Var(&listenArgs, "listen", "PORTS:MODE[:tls], repeatable (default 443:direct:tls)")
+
 	hostArg := flag.String("host", "0.0.0.0", "Address to bind")
-	certArg := flag.String("cert", "", "Path to the TLS certificate chain (required)")
-	keyArg := flag.String("key", "", "Path to the TLS private key (required)")
+	certArg := flag.String("cert", "", "TLS certificate chain, required by any :tls listener")
+	keyArg := flag.String("key", "", "TLS private key, required by any :tls listener")
 	sshHostArg := flag.String("ssh-host", "127.0.0.1", "Upstream SSH host")
 	sshPortArg := flag.String("ssh-port", "22", "Upstream SSH port")
 	connTimeoutArg := flag.Int("connect-timeout-secs", 5, "Seconds to wait for the SSH backend")
-	handshakeTimeoutArg := flag.Int("handshake-timeout-secs", 10, "Seconds a client has to finish the TLS handshake")
+	handshakeTimeoutArg := flag.Int("handshake-timeout-secs", 10, "Seconds a client has to finish its handshake")
 	maxConnsArg := flag.Int("max-conns", 0, "Maximum concurrent tunnels (0 = unlimited)")
 	shutdownGraceArg := flag.Int("shutdown-grace-secs", 10, "Seconds to let tunnels drain on SIGTERM")
 
+	payloadStatusArg := flag.String("payload-status", "200 OK",
+		"Status line returned to payload clients (empty = reply with nothing)")
+	payloadMatchArg := flag.String("payload-match", "",
+		"If set, a payload client's request head must contain this substring")
+	extraHeadsArg := flag.Int("payload-extra-heads", 0,
+		"Extra request heads to consume after the first, for clients that send a split payload")
+
 	flag.Parse()
 
-	ports, err := parsePorts(*portsArg)
+	listeners, err := parseListeners(listenArgs)
 	if err != nil {
 		log.Fatalf("invalid -listen: %v", err)
 	}
-	if *certArg == "" || *keyArg == "" {
-		log.Fatal("-cert and -key are required")
-	}
 
-	// Loaded up front so a bad path or an unreadable key fails at startup
-	// rather than on the first client's handshake.
-	cert, err := tls.LoadX509KeyPair(*certArg, *keyArg)
+	payloadResponse, err := buildResponse(*payloadStatusArg)
 	if err != nil {
-		log.Fatalf("loading TLS key pair: %v", err)
+		log.Fatalf("invalid -payload-status: %v", err)
 	}
-	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
+	if *extraHeadsArg < 0 || *extraHeadsArg > 8 {
+		log.Fatal("-payload-extra-heads must be between 0 and 8")
 	}
 
-	backend := net.JoinHostPort(*sshHostArg, *sshPortArg)
+	// Loaded up front so a bad path fails at startup rather than on the first
+	// client's handshake.
+	var tlsConfig *tls.Config
+	if anyTLS(listeners) {
+		if *certArg == "" || *keyArg == "" {
+			log.Fatal("a :tls listener was configured but -cert/-key were not supplied")
+		}
+		cert, err := tls.LoadX509KeyPair(*certArg, *keyArg)
+		if err != nil {
+			log.Fatalf("loading TLS key pair: %v", err)
+		}
+		tlsConfig = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
+	}
+
 	cfg := &config{
-		backend:          backend,
+		backend:          net.JoinHostPort(*sshHostArg, *sshPortArg),
 		connectTimeout:   time.Duration(*connTimeoutArg) * time.Second,
 		handshakeTimeout: time.Duration(*handshakeTimeoutArg) * time.Second,
+		payloadResponse:  payloadResponse,
+		payloadMatch:     *payloadMatchArg,
+		extraHeads:       *extraHeadsArg,
 	}
 
 	var sem chan struct{}
@@ -76,26 +159,25 @@ func main() {
 		sem = make(chan struct{}, *maxConnsArg)
 	}
 
-	// Bind every port before serving, so a clash or a privileged port without
-	// permission is a startup failure instead of a listener that never accepts.
-	listeners := make([]net.Listener, 0, len(ports))
-	for _, port := range ports {
-		address := net.JoinHostPort(*hostArg, port)
-		l, err := tls.Listen("tcp", address, tlsConfig)
+	// Bind everything before serving, so a clash or a privileged port without
+	// permission is a startup failure rather than a listener that never accepts.
+	sockets := make([]net.Listener, 0, len(listeners))
+	for _, l := range listeners {
+		s, err := bind(*hostArg, l, tlsConfig)
 		if err != nil {
-			for _, open := range listeners {
+			for _, open := range sockets {
 				_ = open.Close()
 			}
-			log.Fatalf("listening on %s: %v", address, err)
+			log.Fatalf("listening on %s: %v", l, err)
 		}
-		listeners = append(listeners, l)
+		sockets = append(sockets, s)
 	}
 
 	var listenerWG, connWG sync.WaitGroup
-	for i, port := range ports {
+	for i, l := range listeners {
 		listenerWG.Add(1)
-		go acceptLoop(listeners[i], port, cfg, sem, &listenerWG, &connWG)
-		log.Printf("accepting SSH over TLS on %s:%s -> %s", *hostArg, port, backend)
+		go acceptLoop(sockets[i], l, cfg, sem, &listenerWG, &connWG)
+		log.Printf("listening on %s:%s mode=%s tls=%t -> %s", *hostArg, l.port, l.mode, l.useTLS, cfg.backend)
 	}
 
 	sigChan := make(chan os.Signal, 1)
@@ -103,8 +185,8 @@ func main() {
 	sig := <-sigChan
 
 	log.Printf("received %s, closing listeners", sig)
-	for _, l := range listeners {
-		_ = l.Close()
+	for _, s := range sockets {
+		_ = s.Close()
 	}
 	listenerWG.Wait()
 
@@ -123,44 +205,102 @@ func main() {
 	}
 }
 
-type config struct {
-	backend          string
-	connectTimeout   time.Duration
-	handshakeTimeout time.Duration
-}
-
-func parsePorts(list string) ([]string, error) {
-	var ports []string
-	seen := make(map[string]bool)
-	for _, raw := range strings.Split(list, ",") {
-		port := strings.TrimSpace(raw)
-		if port == "" {
-			continue
-		}
-		n, err := strconv.Atoi(port)
-		if err != nil || n < 1 || n > 65535 {
-			return nil, fmt.Errorf("invalid port %q", port)
-		}
-		if seen[port] {
-			return nil, fmt.Errorf("port %s listed twice", port)
-		}
-		seen[port] = true
-		ports = append(ports, port)
+// parseListeners accepts both "PORTS:MODE[:tls]" and a bare port list, the
+// latter meaning direct over TLS so that units written for the TLS-only version
+// keep working.
+func parseListeners(args []string) ([]listener, error) {
+	if len(args) == 0 {
+		args = []string{"443:direct:tls"}
 	}
-	if len(ports) == 0 {
+
+	var out []listener
+	for _, raw := range args {
+		fields := strings.Split(raw, ":")
+		if len(fields) > 3 {
+			return nil, fmt.Errorf("expected PORTS:MODE[:tls], got %q", raw)
+		}
+
+		m := modeDirect
+		useTLS := len(fields) == 1
+		if len(fields) >= 2 {
+			m = mode(strings.ToLower(strings.TrimSpace(fields[1])))
+			switch m {
+			case modeDirect, modeConnect, modePayload, modeAuto:
+			default:
+				return nil, fmt.Errorf("unknown mode %q in %q (want direct, connect, payload or auto)", fields[1], raw)
+			}
+		}
+		if len(fields) == 3 {
+			if !strings.EqualFold(strings.TrimSpace(fields[2]), "tls") {
+				return nil, fmt.Errorf("third field of %q must be \"tls\", got %q", raw, fields[2])
+			}
+			useTLS = true
+		}
+
+		for _, port := range strings.Split(fields[0], ",") {
+			port = strings.TrimSpace(port)
+			if port == "" {
+				continue
+			}
+			n, err := strconv.Atoi(port)
+			if err != nil || n < 1 || n > 65535 {
+				return nil, fmt.Errorf("invalid port %q", port)
+			}
+			out = append(out, listener{port: port, mode: m, useTLS: useTLS})
+		}
+	}
+
+	if len(out) == 0 {
 		return nil, errors.New("no ports given")
 	}
-	return ports, nil
+	seen := make(map[string]listener, len(out))
+	for _, l := range out {
+		if prev, dup := seen[l.port]; dup {
+			return nil, fmt.Errorf("port %s is configured twice (%s and %s)", l.port, prev.mode, l.mode)
+		}
+		seen[l.port] = l
+	}
+	return out, nil
 }
 
-func acceptLoop(l net.Listener, port string, cfg *config, sem chan struct{},
+// buildResponse renders the payload reply. An empty status means "say nothing",
+// which some clients expect. CR and LF are rejected so a status line cannot
+// smuggle in extra headers.
+func buildResponse(status string) ([]byte, error) {
+	if strings.TrimSpace(status) == "" {
+		return nil, nil
+	}
+	if strings.ContainsAny(status, "\r\n") {
+		return nil, errors.New("status line must not contain CR or LF")
+	}
+	return []byte("HTTP/1.1 " + status + "\r\n\r\n"), nil
+}
+
+func anyTLS(listeners []listener) bool {
+	for _, l := range listeners {
+		if l.useTLS {
+			return true
+		}
+	}
+	return false
+}
+
+func bind(host string, l listener, tlsConfig *tls.Config) (net.Listener, error) {
+	address := net.JoinHostPort(host, l.port)
+	if l.useTLS {
+		return tls.Listen("tcp", address, tlsConfig)
+	}
+	return net.Listen("tcp", address)
+}
+
+func acceptLoop(s net.Listener, l listener, cfg *config, sem chan struct{},
 	listenerWG, connWG *sync.WaitGroup) {
 	defer listenerWG.Done()
-	defer l.Close()
+	defer s.Close()
 
 	var backoff time.Duration
 	for {
-		client, err := l.Accept()
+		client, err := s.Accept()
 		if err != nil {
 			// A closed listener means shutdown, not a failure to retry.
 			if errors.Is(err, net.ErrClosed) {
@@ -173,7 +313,7 @@ func acceptLoop(l net.Listener, port string, cfg *config, sem chan struct{},
 			} else if backoff < time.Second {
 				backoff *= 2
 			}
-			log.Printf("[:%s] accept failed: %v (retrying in %v)", port, err, backoff)
+			log.Printf("[:%s] accept failed: %v (retrying in %v)", l.port, err, backoff)
 			time.Sleep(backoff)
 			continue
 		}
@@ -183,7 +323,7 @@ func acceptLoop(l net.Listener, port string, cfg *config, sem chan struct{},
 			select {
 			case sem <- struct{}{}:
 			default:
-				log.Printf("[:%s] at -max-conns, refusing %s", port, client.RemoteAddr())
+				log.Printf("[:%s] at -max-conns, refusing %s", l.port, client.RemoteAddr())
 				_ = client.Close()
 				continue
 			}
@@ -195,15 +335,14 @@ func acceptLoop(l net.Listener, port string, cfg *config, sem chan struct{},
 			if sem != nil {
 				defer func() { <-sem }()
 			}
-			handleClient(client, port, cfg)
+			handleClient(client, l, cfg)
 		}()
 	}
 }
 
 // setKeepAlive enables TCP keepalive, unwrapping the TLS connection first: a
-// type assertion to *net.TCPConn cannot match *tls.Conn, so without this every
-// tunnel would run without keepalive and idle NAT entries would be dropped
-// silently.
+// type assertion to *net.TCPConn cannot match *tls.Conn, so without this a TLS
+// listener would silently run without keepalive.
 func setKeepAlive(conn net.Conn) {
 	if tlsConn, ok := conn.(*tls.Conn); ok {
 		conn = tlsConn.NetConn()
@@ -216,7 +355,7 @@ func setKeepAlive(conn net.Conn) {
 	_ = tcpConn.SetKeepAlivePeriod(15 * time.Second)
 }
 
-func handleClient(client net.Conn, port string, cfg *config) {
+func handleClient(client net.Conn, l listener, cfg *config) {
 	defer client.Close()
 	setKeepAlive(client)
 
@@ -227,25 +366,196 @@ func handleClient(client net.Conn, port string, cfg *config) {
 		ctx, cancel := context.WithTimeout(context.Background(), cfg.handshakeTimeout)
 		defer cancel()
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
-			log.Printf("[:%s] TLS handshake with %s failed: %v", port, client.RemoteAddr(), err)
+			log.Printf("[:%s] TLS handshake with %s failed: %v", l.port, client.RemoteAddr(), err)
 			return
 		}
 	}
 
+	// Anything the client sends after its handshake and before the relay starts
+	// is buffered in this reader, so it has to be the relay's source. Direct
+	// mode skips it entirely and keeps the kernel copy fast path.
+	var clientSrc io.Reader = client
+	if l.mode != modeDirect {
+		reader := bufio.NewReaderSize(client, relayBufferSize)
+		if err := client.SetReadDeadline(time.Now().Add(cfg.handshakeTimeout)); err != nil {
+			return
+		}
+		if err := handshake(client, reader, l.mode, cfg); err != nil {
+			log.Printf("[:%s] handshake from %s failed: %v", l.port, client.RemoteAddr(), err)
+			return
+		}
+		// An established tunnel is long-lived and idle stretches are normal.
+		if err := client.SetReadDeadline(time.Time{}); err != nil {
+			return
+		}
+		clientSrc = reader
+	}
+
 	upstream, err := net.DialTimeout("tcp", cfg.backend, cfg.connectTimeout)
 	if err != nil {
-		log.Printf("[:%s] dialling backend %s failed: %v", port, cfg.backend, err)
+		log.Printf("[:%s] dialling backend %s failed: %v", l.port, cfg.backend, err)
 		return
 	}
 	defer upstream.Close()
 	setKeepAlive(upstream)
 
-	relay(client, upstream)
+	relay(client, clientSrc, upstream)
+}
+
+func handshake(client net.Conn, reader *bufio.Reader, m mode, cfg *config) error {
+	auto := m == modeAuto
+	if auto {
+		resolved, err := sniff(reader)
+		if err != nil {
+			return err
+		}
+		m = resolved
+	}
+
+	switch m {
+	case modeDirect:
+		// The client is already speaking SSH; nothing to negotiate.
+		return nil
+
+	case modeConnect:
+		return handshakeConnect(client, reader)
+
+	case modePayload:
+		head, err := readRequestHead(reader)
+		if err != nil {
+			return fmt.Errorf("reading request head: %w", err)
+		}
+		if cfg.payloadMatch != "" && !strings.Contains(head, cfg.payloadMatch) {
+			return fmt.Errorf("request head does not contain %q", cfg.payloadMatch)
+		}
+		// Clients that split their payload into several request blocks need the
+		// extras consumed, or sshd would receive them as protocol garbage.
+		for i := 0; i < cfg.extraHeads; i++ {
+			if _, err := readRequestHead(reader); err != nil {
+				return fmt.Errorf("reading extra request head %d: %w", i+1, err)
+			}
+		}
+		// Payloads are often padded with blank lines. Only already-buffered
+		// bytes are consumed, so this never waits for data the client is not
+		// going to send.
+		drainBufferedNewlines(reader)
+
+		if len(cfg.payloadResponse) == 0 {
+			return nil
+		}
+		_, err = client.Write(cfg.payloadResponse)
+		return err
+	}
+
+	return fmt.Errorf("unhandled mode %q", m)
+}
+
+// sniff inspects the first bytes to decide how a client on an auto port wants
+// to be greeted.
+func sniff(reader *bufio.Reader) (mode, error) {
+	// Peek returns short with an error if fewer bytes arrive; a client that
+	// sends nothing is treated as already speaking SSH.
+	prefix, err := reader.Peek(8)
+	switch {
+	case len(prefix) == 0:
+		if err != nil {
+			return "", fmt.Errorf("client sent nothing: %w", err)
+		}
+		return modeDirect, nil
+	case hasFoldPrefix(prefix, "CONNECT "):
+		return modeConnect, nil
+	case hasFoldPrefix(prefix, "SSH-"):
+		return modeDirect, nil
+	default:
+		return modePayload, nil
+	}
+}
+
+func hasFoldPrefix(b []byte, prefix string) bool {
+	if len(b) < len(prefix) {
+		return false
+	}
+	return strings.EqualFold(string(b[:len(prefix)]), prefix)
+}
+
+// handshakeConnect implements the server half of an HTTP CONNECT proxy.
+//
+// The host:port the client asks for is deliberately ignored: every tunnel is
+// relayed to the configured SSH backend. Honouring arbitrary targets would turn
+// this into an open relay and get the server's address blocklisted.
+func handshakeConnect(client net.Conn, reader *bufio.Reader) error {
+	head, err := readRequestHead(reader)
+	if err != nil {
+		return fmt.Errorf("reading CONNECT request: %w", err)
+	}
+
+	requestLine := head
+	if i := strings.IndexByte(head, '\n'); i >= 0 {
+		requestLine = head[:i]
+	}
+	requestLine = strings.TrimRight(requestLine, "\r\n")
+
+	fields := strings.Fields(requestLine)
+	if len(fields) == 0 || !strings.EqualFold(fields[0], "CONNECT") {
+		_, _ = client.Write([]byte("HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n"))
+		return fmt.Errorf("expected a CONNECT request, got %q", requestLine)
+	}
+
+	drainBufferedNewlines(reader)
+	_, err = client.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
+	return err
+}
+
+// readRequestHead reads up to and including the blank line that ends an HTTP
+// request head, refusing anything oversized rather than buffering it.
+func readRequestHead(reader *bufio.Reader) (string, error) {
+	var head strings.Builder
+	for lines := 0; ; lines++ {
+		if lines >= maxHeaderLines {
+			return "", fmt.Errorf("request head exceeds %d lines", maxHeaderLines)
+		}
+
+		// ReadSlice reports ErrBufferFull instead of growing without bound, so
+		// a single endless line cannot exhaust memory.
+		line, err := reader.ReadSlice('\n')
+		if errors.Is(err, bufio.ErrBufferFull) {
+			return "", fmt.Errorf("request head line exceeds %d bytes", relayBufferSize)
+		}
+		if err != nil {
+			return "", err
+		}
+		if head.Len()+len(line) > maxHeaderBytes {
+			return "", fmt.Errorf("request head exceeds %d bytes", maxHeaderBytes)
+		}
+		// line aliases the reader's buffer, so this copy must happen before the
+		// next read.
+		head.Write(line)
+
+		if strings.TrimRight(string(line), "\r\n") == "" {
+			return head.String(), nil
+		}
+	}
+}
+
+// drainBufferedNewlines discards padding newlines that are already buffered.
+// Checking Buffered() first is what keeps this non-blocking: a bare Peek would
+// wait out the whole handshake deadline on every connection whose client has
+// finished sending and is waiting for the server to reply.
+func drainBufferedNewlines(reader *bufio.Reader) {
+	for reader.Buffered() > 0 {
+		b, err := reader.Peek(1)
+		if err != nil || (b[0] != '\r' && b[0] != '\n') {
+			return
+		}
+		if _, err := reader.ReadByte(); err != nil {
+			return
+		}
+	}
 }
 
 // relay copies in both directions until either side finishes, then closes both
 // so the opposite copy cannot block forever.
-func relay(client, upstream net.Conn) {
+func relay(client net.Conn, clientSrc io.Reader, upstream net.Conn) {
 	var once sync.Once
 	closeBoth := func() {
 		once.Do(func() {
@@ -260,7 +570,7 @@ func relay(client, upstream net.Conn) {
 		defer wg.Done()
 		defer closeBoth()
 		buf := make([]byte, relayBufferSize)
-		_, _ = io.CopyBuffer(upstream, client, buf)
+		_, _ = io.CopyBuffer(upstream, clientSrc, buf)
 	}()
 
 	buf := make([]byte, relayBufferSize)

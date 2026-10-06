@@ -1,5 +1,5 @@
 #!/bin/bash
-# SSH-over-TLS setup and management.
+# SSH tunnel setup and management.
 set -u
 
 C_RESET='\033[0m'; C_BOLD='\033[1m'; C_DIM='\033[2m'
@@ -14,6 +14,8 @@ BIN="$INSTALL_DIR/ayanakoji_proxy"
 
 [ "$(id -u)" -eq 0 ] || { echo -e "${C_RED}Run as root (sudo menu.sh)${C_RESET}"; exit 1; }
 
+# Internals are prefixed per function: a bare `local __reply` would shadow a
+# caller's variable of the same name and printf -v would write to the wrong scope.
 ask() {
     local __ask_var="$1" __ask_prompt="$2" __ask_default="${3:-}" __ask_reply=""
     if [ -n "$__ask_default" ]; then
@@ -25,11 +27,12 @@ ask() {
 }
 
 ask_yn() {
-    local __p="$1" __d="${2:-n}" __r="" __hint
-    [ "$__d" = "y" ] && __hint="Y/n" || __hint="y/N"
+    local __yn_p="$1" __yn_d="${2:-n}" __yn_r="" __yn_hint
+    [ "$__yn_d" = "y" ] && __yn_hint="Y/n" || __yn_hint="y/N"
     while true; do
-        read -rp "$(echo -e "👉 ${__p} ${C_DIM}[${__hint}]${C_RESET}: ")" __r
-        case "${__r:-$__d}" in
+        read -rp "$(echo -e "👉 ${__yn_p} ${C_DIM}[${__yn_hint}]${C_RESET}: ")" __yn_r \
+            || { [ "$__yn_d" = "y" ] && return 0 || return 1; }
+        case "${__yn_r:-$__yn_d}" in
             y | Y | yes) return 0 ;;
             n | N | no) return 1 ;;
             *) echo -e "${C_RED}  ✗ Answer y or n.${C_RESET}" ;;
@@ -37,101 +40,186 @@ ask_yn() {
     done
 }
 
-valid_ports() {
-    local p
-    for p in ${1//,/ }; do
-        [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le 65535 ] || return 1
+L_PORT=(); L_MODE=(); L_TLS=()
+CERT=""; KEY=""
+PAYLOAD_STATUS="200 OK"; PAYLOAD_MATCH=""; EXTRA_HEADS="0"
+PAYLOAD_ASKED=0
+SSH_HOST="127.0.0.1"; SSH_PORT="22"; MAX_CONNS="0"
+
+mode_label() {
+    case "$1" in
+        direct) echo "SSH direct (no handshake)" ;;
+        connect) echo "HTTP proxy (CONNECT)" ;;
+        payload) echo "Client payload" ;;
+        auto) echo "Any of the above (auto)" ;;
+    esac
+}
+
+port_taken() {
+    local i
+    for ((i = 0; i < ${#L_PORT[@]}; i++)); do
+        [ "${L_PORT[i]}" = "$1" ] && return 0
     done
-    [ -n "$1" ]
+    return 1
 }
 
-make_self_signed() {
-    local cn="$1"
-    mkdir -p "$CERT_DIR"
-    # The key and certificate must go to separate files. Passing one path to
-    # both -keyout and -out makes the certificate truncate the key.
-    openssl req -x509 -newkey rsa:2048 -nodes \
-        -keyout "$CERT_DIR/key.pem" -out "$CERT_DIR/cert.pem" \
-        -days 3650 -subj "/CN=$cn" > /dev/null 2>&1 || return 1
-    chmod 600 "$CERT_DIR/key.pem"
-    chmod 644 "$CERT_DIR/cert.pem"
-    CERT="$CERT_DIR/cert.pem"
-    KEY="$CERT_DIR/key.pem"
-}
-
-setup() {
-    clear
-    echo -e "${C_BOLD}${C_PURPLE}=== SSH over SSL/TLS — setup ===${C_RESET}"
-    echo -e "${C_DIM}Clients open a TLS connection and speak SSH inside it. No HTTP,"
-    echo -e "no websocket, no payload.${C_RESET}\n"
-
-    local PORTS SSH_HOST SSH_PORT MAX_CONNS CN
-    CERT=""; KEY=""
-
+ask_port() {
+    local __p_var="$1" __p_default="$2" __p_reply=""
     while true; do
-        ask PORTS "TLS port(s), comma-separated" "443"
-        valid_ports "$PORTS" && break
-        echo -e "${C_RED}  ✗ Ports must be numbers from 1 to 65535.${C_RESET}"
+        ask __p_reply "Port" "$__p_default"
+        if ! [[ "$__p_reply" =~ ^[0-9]+$ ]] || [ "$__p_reply" -lt 1 ] || [ "$__p_reply" -gt 65535 ]; then
+            echo -e "${C_RED}  ✗ A port is a number from 1 to 65535.${C_RESET}"; continue
+        fi
+        if port_taken "$__p_reply"; then
+            echo -e "${C_RED}  ✗ Port $__p_reply is already assigned here.${C_RESET}"; continue
+        fi
+        printf -v "$__p_var" '%s' "$__p_reply"
+        return 0
     done
+}
 
+ask_payload_options() {
+    [ "$PAYLOAD_ASKED" = "1" ] && return 0
+    PAYLOAD_ASKED=1
+    # Asked as a yes/no because an empty answer to `ask` takes the default, so
+    # a blank status line would otherwise be unreachable.
+    if ask_yn "Reply to payload clients with a status line" "y"; then
+        ask PAYLOAD_STATUS "Status line" "200 OK"
+    else
+        PAYLOAD_STATUS=""
+        echo -e "${C_GREEN}  ✓ payload clients get no reply at all${C_RESET}"
+    fi
+    if ask_yn "Require a secret tag in the payload (drops port scanners)" "n"; then
+        ask PAYLOAD_MATCH "Required substring" "X-Tunnel-Key: change-me"
+    fi
+    if ask_yn "Does your client send a split payload (two request blocks)" "n"; then
+        ask EXTRA_HEADS "Extra request blocks to consume" "1"
+    fi
+}
+
+add_listener() {
+    local m="$1" default_port="$2" force_tls="$3" port tls=0
+    echo -e "\n${C_BOLD}${C_CYAN}$(mode_label "$m")${C_RESET}"
+    case "$m" in
+        direct) echo -e "  ${C_DIM}Client speaks SSH immediately. With TLS this is \"SSH + SSL/TLS\".${C_RESET}" ;;
+        connect) echo -e "  ${C_DIM}Client sends CONNECT host:port and gets 200 Connection established.${C_RESET}" ;;
+        payload) echo -e "  ${C_DIM}Client sends an HTTP request head and gets your status line.${C_RESET}" ;;
+        auto) echo -e "  ${C_DIM}Sniffs the first bytes: CONNECT, a payload, or raw SSH.${C_RESET}" ;;
+    esac
+
+    ask_port port "$default_port"
+
+    if [ "$force_tls" = "1" ]; then
+        tls=1
+        echo -e "  ${C_DIM}TLS: yes (this mode is TLS by definition)${C_RESET}"
+    elif ask_yn "Wrap this port in SSL/TLS" "n"; then
+        tls=1
+    fi
+
+    if [ "$tls" = "1" ] && [ -z "$CERT" ]; then
+        choose_certificate || return 1
+    fi
+    case "$m" in payload | auto) ask_payload_options ;; esac
+
+    L_PORT+=("$port"); L_MODE+=("$m"); L_TLS+=("$tls")
+    echo -e "${C_GREEN}  ✓ added $(mode_label "$m") on port $port$([ "$tls" = "1" ] && echo " over TLS")${C_RESET}"
+}
+
+choose_certificate() {
     echo
-    echo -e "  ${C_GREEN}[1]${C_RESET} Generate a self-signed certificate ${C_DIM}(works with most tunnel clients)${C_RESET}"
+    echo -e "  ${C_GREEN}[1]${C_RESET} Generate a self-signed certificate ${C_DIM}(most tunnel clients skip verification)${C_RESET}"
     echo -e "  ${C_GREEN}[2]${C_RESET} Use an existing certificate ${C_DIM}(Let's Encrypt, or your own)${C_RESET}"
-    echo
-    local certchoice
-    ask certchoice "Certificate" "1"
-
-    if [ "$certchoice" = "2" ]; then
+    local choice cn
+    ask choice "Certificate" "1"
+    if [ "$choice" = "2" ]; then
         while true; do
             ask CERT "Certificate (fullchain) path" "/etc/letsencrypt/live/example.com/fullchain.pem"
             ask KEY "Private key path" "/etc/letsencrypt/live/example.com/privkey.pem"
-            if [ -f "$CERT" ] && [ -f "$KEY" ]; then break; fi
-            echo -e "${C_RED}  ✗ Both files must exist. Not found:${C_RESET}"
-            [ -f "$CERT" ] || echo -e "${C_RED}      $CERT${C_RESET}"
-            [ -f "$KEY" ] || echo -e "${C_RED}      $KEY${C_RESET}"
-            ask_yn "  Try again" "y" || return 1
+            [ -f "$CERT" ] && [ -f "$KEY" ] && return 0
+            echo -e "${C_RED}  ✗ Both files must exist.${C_RESET}"
+            [ -f "$CERT" ] || echo -e "${C_RED}      missing: $CERT${C_RESET}"
+            [ -f "$KEY" ] || echo -e "${C_RED}      missing: $KEY${C_RESET}"
+            ask_yn "  Try again" "y" || { CERT=""; KEY=""; return 1; }
         done
-    else
-        ask CN "Common name for the certificate" "$(hostname -f 2>/dev/null || hostname)"
-        if ! make_self_signed "$CN"; then
-            echo -e "${C_RED}  ✗ Could not generate the certificate.${C_RESET}"
-            read -rp "Press Enter..." _; return 1
-        fi
-        echo -e "${C_GREEN}  ✓ self-signed certificate in $CERT_DIR${C_RESET}"
     fi
-
-    echo
-    ask SSH_HOST "SSH backend host" "127.0.0.1"
-    ask SSH_PORT "SSH backend port" "22"
-    MAX_CONNS="0"
-    if ask_yn "Cap concurrent tunnels" "n"; then
-        ask MAX_CONNS "Maximum concurrent tunnels" "2000"
+    ask cn "Common name" "$(hostname -f 2> /dev/null || hostname)"
+    mkdir -p "$CERT_DIR"
+    # Key and certificate must go to separate files: one path for both -keyout
+    # and -out makes the certificate truncate the key.
+    if ! openssl req -x509 -newkey rsa:2048 -nodes \
+        -keyout "$CERT_DIR/key.pem" -out "$CERT_DIR/cert.pem" \
+        -days 3650 -subj "/CN=$cn" > /dev/null 2>&1; then
+        echo -e "${C_RED}  ✗ Could not generate the certificate.${C_RESET}"
+        return 1
     fi
+    chmod 600 "$CERT_DIR/key.pem"; chmod 644 "$CERT_DIR/cert.pem"
+    CERT="$CERT_DIR/cert.pem"; KEY="$CERT_DIR/key.pem"
+    echo -e "${C_GREEN}  ✓ self-signed certificate in $CERT_DIR${C_RESET}"
+}
 
-    local args="\"-listen\" \"$PORTS\" \"-cert\" \"$CERT\" \"-key\" \"$KEY\""
-    args="$args \"-ssh-host\" \"$SSH_HOST\" \"-ssh-port\" \"$SSH_PORT\""
-    [ "$MAX_CONNS" != "0" ] && args="$args \"-max-conns\" \"$MAX_CONNS\""
+show_listeners() {
+    echo -e "${C_BOLD}Ways clients may connect:${C_RESET}"
+    if [ "${#L_PORT[@]}" -eq 0 ]; then
+        echo -e "  ${C_DIM}(none yet — add at least one)${C_RESET}"; return
+    fi
+    local i note
+    for ((i = 0; i < ${#L_PORT[@]}; i++)); do
+        [ "${L_TLS[i]}" = "1" ] && note=" ${C_CYAN}+SSL/TLS${C_RESET}" || note=""
+        printf "  ${C_GREEN}%2d.${C_RESET} port ${C_BOLD}%-6s${C_RESET} %-26s%b\n" \
+            "$((i + 1))" "${L_PORT[i]}" "$(mode_label "${L_MODE[i]}")" "$note"
+    done
+}
 
-    echo
-    echo -e "${C_BOLD}${C_PURPLE}=== Review ===${C_RESET}\n"
-    echo -e "  ${C_BOLD}Listening:${C_RESET}  TLS on $PORTS"
-    echo -e "  ${C_BOLD}Backend:${C_RESET}    $SSH_HOST:$SSH_PORT"
-    echo -e "  ${C_BOLD}Certificate:${C_RESET} $CERT"
-    echo -e "  ${C_BOLD}Key:${C_RESET}        $KEY"
-    [ "$MAX_CONNS" != "0" ] && echo -e "  ${C_BOLD}Max tunnels:${C_RESET} $MAX_CONNS"
-    echo -e "\n  ${C_DIM}$BIN $(echo "$args" | tr -d '"')${C_RESET}\n"
+build_args() {
+    local -n out="$1"
+    out=(); local i spec
+    for ((i = 0; i < ${#L_PORT[@]}; i++)); do
+        spec="${L_PORT[i]}:${L_MODE[i]}"
+        [ "${L_TLS[i]}" = "1" ] && spec="$spec:tls"
+        out+=(-listen "$spec")
+    done
+    out+=(-ssh-host "$SSH_HOST" -ssh-port "$SSH_PORT")
+    [ -n "$CERT" ] && out+=(-cert "$CERT" -key "$KEY")
+    if needs_payload; then
+        out+=(-payload-status "$PAYLOAD_STATUS")
+        [ -n "$PAYLOAD_MATCH" ] && out+=(-payload-match "$PAYLOAD_MATCH")
+        [ "$EXTRA_HEADS" != "0" ] && out+=(-payload-extra-heads "$EXTRA_HEADS")
+    fi
+    [ "$MAX_CONNS" != "0" ] && out+=(-max-conns "$MAX_CONNS")
+    return 0
+}
 
-    ask_yn "Write the service and start it" "y" || { echo -e "\n${C_YELLOW}Nothing changed.${C_RESET}"; read -rp "Press Enter..." _; return 0; }
+needs_payload() {
+    local i
+    for ((i = 0; i < ${#L_MODE[@]}; i++)); do
+        case "${L_MODE[i]}" in payload | auto) return 0 ;; esac
+    done
+    return 1
+}
+
+# systemd splits ExecStart on whitespace and expands %, so each argument is
+# quoted with embedded quotes, backslashes and % escaped.
+sd_quote() {
+    local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//%/%%}"
+    printf '"%s"' "$s"
+}
+
+write_service() {
+    local args=() quoted="" a
+    build_args args
+    for a in "${args[@]}"; do quoted="$quoted $(sd_quote "$a")"; done
+    local ro=""
+    [ -n "$CERT" ] && ro="ReadOnlyPaths=$(dirname "$CERT")"
 
     cat > "$SERVICE_FILE" <<UNIT
 [Unit]
-Description=Ayanakoji SSH-over-TLS proxy
+Description=Ayanakoji SSH tunnel proxy
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$BIN $args
+ExecStart=$BIN$quoted
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
@@ -144,7 +232,7 @@ ProtectHome=read-only
 ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
-ReadOnlyPaths=$CERT_DIR
+$ro
 
 [Install]
 WantedBy=multi-user.target
@@ -154,20 +242,111 @@ UNIT
     systemctl enable "$SERVICE_NAME" > /dev/null 2>&1
     if systemctl restart "$SERVICE_NAME"; then
         echo -e "\n${C_GREEN}${C_BOLD}  ✓ $SERVICE_NAME is running.${C_RESET}"
-        local first_port="${PORTS%%,*}"
-        echo -e "\n${C_BOLD}Connect from a client:${C_RESET}"
-        echo -e "${C_DIM}  Tunnel apps: host = this server, port = $first_port, mode = SSH + SSL/TLS (direct)${C_RESET}"
-        echo -e "${C_DIM}  OpenSSH via stunnel/socat:${C_RESET}"
-        echo -e "${C_DIM}    ssh -o ProxyCommand='openssl s_client -quiet -verify_quiet -connect %h:$first_port' user@this-server${C_RESET}"
+        client_hints
     else
         echo -e "\n${C_RED}  ✗ Failed to start. journalctl -u $SERVICE_NAME -n 30${C_RESET}"
+    fi
+}
+
+client_hints() {
+    echo -e "\n${C_BOLD}In your tunnel client:${C_RESET}"
+    local i
+    for ((i = 0; i < ${#L_PORT[@]}; i++)); do
+        local tlsnote=""
+        [ "${L_TLS[i]}" = "1" ] && tlsnote=" + SSL/TLS"
+        case "${L_MODE[i]}" in
+            direct)  echo -e "  ${C_DIM}port ${L_PORT[i]}: mode \"SSH${tlsnote:- direct}\"${C_RESET}" ;;
+            connect) echo -e "  ${C_DIM}port ${L_PORT[i]}: HTTP proxy = this host:${L_PORT[i]}${tlsnote}${C_RESET}" ;;
+            payload) echo -e "  ${C_DIM}port ${L_PORT[i]}: send your payload to this host:${L_PORT[i]}${tlsnote}${C_RESET}" ;;
+            auto)    echo -e "  ${C_DIM}port ${L_PORT[i]}: payload, HTTP proxy or plain SSH all work${tlsnote}${C_RESET}" ;;
+        esac
+    done
+}
+
+setup() {
+    L_PORT=(); L_MODE=(); L_TLS=(); CERT=""; KEY=""; PAYLOAD_ASKED=0
+    PAYLOAD_STATUS="200 OK"; PAYLOAD_MATCH=""; EXTRA_HEADS="0"; MAX_CONNS="0"
+
+    while true; do
+        clear
+        echo -e "${C_BOLD}${C_PURPLE}=== Tunnel setup ===${C_RESET}\n"
+        show_listeners
+        echo
+        echo -e "  ${C_GREEN}[1]${C_RESET} SSH + SSL/TLS ${C_DIM}(direct, TLS only)${C_RESET}"
+        echo -e "  ${C_GREEN}[2]${C_RESET} HTTP proxy ${C_DIM}(CONNECT)${C_RESET}"
+        echo -e "  ${C_GREEN}[3]${C_RESET} Client payload"
+        echo -e "  ${C_GREEN}[4]${C_RESET} Accept any of the above ${C_DIM}(auto-detect)${C_RESET}"
+        echo
+        echo -e "  ${C_CYAN}[p]${C_RESET} Preset: TLS on 443, proxy on 8888, payload on 2053"
+        echo -e "  ${C_YELLOW}[r]${C_RESET} Remove a listener"
+        echo -e "  ${C_BOLD}[d]${C_RESET} Done — review and save"
+        echo -e "  ${C_RED}[q]${C_RESET} Cancel"
+        echo
+        local choice
+        # A failed read means EOF or a closed stdin. Without this the default
+        # branch below would loop forever instead of ending.
+        read -rp "$(echo -e "👉 Choice: ")" choice \
+            || { echo -e "\n${C_YELLOW}Input ended, nothing changed.${C_RESET}"; return 0; }
+        case "${choice,,}" in
+            1) add_listener direct 443 1 ;;
+            2) add_listener connect 8888 0 ;;
+            3) add_listener payload 2053 0 ;;
+            4) add_listener auto 8443 0 ;;
+            p) L_PORT=(443 8888 2053); L_MODE=(direct connect payload); L_TLS=(1 0 0)
+               choose_certificate && ask_payload_options
+               echo -e "${C_GREEN}  ✓ preset loaded${C_RESET}" ;;
+            r) if [ "${#L_PORT[@]}" -eq 0 ]; then echo -e "${C_YELLOW}  ! nothing to remove${C_RESET}"; else
+                   local n; ask n "Number to remove" ""
+                   if [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le "${#L_PORT[@]}" ]; then
+                       local x=$((n - 1))
+                       echo -e "${C_GREEN}  ✓ removed port ${L_PORT[x]}${C_RESET}"
+                       L_PORT=("${L_PORT[@]:0:x}" "${L_PORT[@]:$((x + 1))}")
+                       L_MODE=("${L_MODE[@]:0:x}" "${L_MODE[@]:$((x + 1))}")
+                       L_TLS=("${L_TLS[@]:0:x}" "${L_TLS[@]:$((x + 1))}")
+                   else echo -e "${C_RED}  ✗ no listener numbered '$n'${C_RESET}"; fi
+               fi ;;
+            d) if [ "${#L_PORT[@]}" -eq 0 ]; then
+                   echo -e "${C_RED}  ✗ Add at least one listener first.${C_RESET}"; sleep 1.5; continue
+               fi; break ;;
+            q) echo -e "\n${C_YELLOW}Cancelled, nothing changed.${C_RESET}"; sleep 1; return 0 ;;
+            *) continue ;;
+        esac
+        echo; read -rp "$(echo -e "${C_DIM}Press Enter to continue...${C_RESET}")" _
+    done
+
+    echo
+    ask SSH_HOST "SSH backend host" "$SSH_HOST"
+    ask SSH_PORT "SSH backend port" "$SSH_PORT"
+    ask_yn "Cap concurrent tunnels" "n" && ask MAX_CONNS "Maximum concurrent tunnels" "2000"
+
+    local args=() a
+    build_args args
+    echo -e "\n${C_BOLD}${C_PURPLE}=== Review ===${C_RESET}\n"
+    show_listeners
+    echo -e "\n  ${C_BOLD}Backend:${C_RESET}  $SSH_HOST:$SSH_PORT"
+    [ -n "$CERT" ] && echo -e "  ${C_BOLD}Cert:${C_RESET}     $CERT"
+    [ -n "$CERT" ] && echo -e "  ${C_BOLD}Key:${C_RESET}      $KEY"
+    needs_payload && echo -e "  ${C_BOLD}Payload:${C_RESET}  reply \"${PAYLOAD_STATUS:-(nothing)}\"${PAYLOAD_MATCH:+, must contain \"$PAYLOAD_MATCH\"}"
+    echo -e "\n  ${C_BOLD}Command:${C_RESET}"
+    printf "${C_DIM}    %s" "$BIN"
+    for a in "${args[@]}"; do
+        case "$a" in -*) printf ' \\\n      %s' "$a" ;; *) printf ' %q' "$a" ;; esac
+    done
+    printf "${C_RESET}\n\n"
+
+    if ask_yn "Write the service and start it" "y"; then
+        write_service
+    else
+        echo -e "\n${C_YELLOW}Nothing changed.${C_RESET}"
     fi
     echo; read -rp "Press Enter to continue..." _
 }
 
 status_line() {
     if systemctl is-active --quiet "$SERVICE_NAME" 2> /dev/null; then
-        echo -e "  ${C_GREEN}●${C_RESET} $SERVICE_NAME  ${C_DIM}$(systemctl show -p ExecStart --value "$SERVICE_NAME" 2>/dev/null | grep -o '\-listen[^-]*' | head -1)${C_RESET}"
+        echo -e "  ${C_GREEN}●${C_RESET} $SERVICE_NAME"
+        systemctl show -p ExecStart --value "$SERVICE_NAME" 2> /dev/null \
+            | grep -oE '\-listen" "[^"]+' | sed 's/-listen" "/    listening: /' | sed 's/^/  /'
     elif [ -f "$SERVICE_FILE" ]; then
         echo -e "  ${C_RED}○${C_RESET} $SERVICE_NAME ${C_DIM}(configured but stopped)${C_RESET}"
     else
@@ -177,7 +356,7 @@ status_line() {
 
 while true; do
     clear
-    echo -e "${C_BOLD}${C_PURPLE}=== Ayanakoji — SSH over SSL/TLS ===${C_RESET}\n"
+    echo -e "${C_BOLD}${C_PURPLE}=== Ayanakoji SSH Tunnel ===${C_RESET}\n"
     status_line
     echo
     echo -e "  ${C_GREEN}[1]${C_RESET} Setup / reconfigure"
@@ -188,7 +367,7 @@ while true; do
     echo -e "  ${C_RED}[99] Uninstall${C_RESET}"
     echo -e "  ${C_YELLOW}[0]${C_RESET} Exit"
     echo
-    read -rp "$(echo -e "👉 Choice: ")" choice
+    read -rp "$(echo -e "👉 Choice: ")" choice || exit 0
     case "$choice" in
         1) setup ;;
         2) bash "$SCRIPT_DIR/ssh-manager.sh" ;;
