@@ -48,9 +48,9 @@ SSH_HOST="127.0.0.1"; SSH_PORT="22"; MAX_CONNS="0"
 
 mode_label() {
     case "$1" in
-        direct) echo "SSH direct (no handshake)" ;;
-        connect) echo "HTTP proxy (CONNECT)" ;;
-        payload) echo "Client payload" ;;
+        direct) echo "SSH + SSL/TLS" ;;
+        connect) echo "We act as the HTTP proxy" ;;
+        payload) echo "Payload sent to us" ;;
         auto) echo "Any of the above (auto)" ;;
     esac
 }
@@ -101,9 +101,11 @@ add_listener() {
     local m="$1" default_port="$2" force_tls="$3" port tls=0
     echo -e "\n${C_BOLD}${C_CYAN}$(mode_label "$m")${C_RESET}"
     case "$m" in
-        direct) echo -e "  ${C_DIM}Client speaks SSH immediately. With TLS this is \"SSH + SSL/TLS\".${C_RESET}" ;;
-        connect) echo -e "  ${C_DIM}Client sends CONNECT host:port and gets 200 Connection established.${C_RESET}" ;;
-        payload) echo -e "  ${C_DIM}Client sends an HTTP request head and gets your status line.${C_RESET}" ;;
+        direct) echo -e "  ${C_DIM}The client opens TLS and speaks SSH inside it. This is the mode that works${C_RESET}"
+                echo -e "  ${C_DIM}when the client sends its payload to its OWN proxy: that proxy consumes${C_RESET}"
+                echo -e "  ${C_DIM}the payload and CONNECT, and only TLS reaches us.${C_RESET}" ;;
+        connect) echo -e "  ${C_DIM}The client points its app at US as the HTTP proxy and sends CONNECT here.${C_RESET}" ;;
+        payload) echo -e "  ${C_DIM}The client sends its payload straight to US, with no proxy in between.${C_RESET}" ;;
         auto) echo -e "  ${C_DIM}Sniffs the first bytes: CONNECT, a payload, or raw SSH.${C_RESET}" ;;
     esac
 
@@ -123,6 +125,11 @@ add_listener() {
 
     L_PORT+=("$port"); L_MODE+=("$m"); L_TLS+=("$tls")
     echo -e "${C_GREEN}  ✓ added $(mode_label "$m") on port $port$([ "$tls" = "1" ] && echo " over TLS")${C_RESET}"
+    if [ "$tls" = "1" ] && [ "$port" != "443" ]; then
+        echo -e "${C_YELLOW}  ! Most ISP and corporate proxies only allow CONNECT to 443, and answer${C_RESET}"
+        echo -e "${C_YELLOW}    403 for anything else. If clients reach this server through their own${C_RESET}"
+        echo -e "${C_YELLOW}    proxy, add a TLS listener on 443 as well.${C_RESET}"
+    fi
 }
 
 choose_certificate() {
@@ -255,7 +262,7 @@ client_hints() {
         local tlsnote=""
         [ "${L_TLS[i]}" = "1" ] && tlsnote=" + SSL/TLS"
         case "${L_MODE[i]}" in
-            direct)  echo -e "  ${C_DIM}port ${L_PORT[i]}: mode \"SSH${tlsnote:- direct}\"${C_RESET}" ;;
+            direct)  echo -e "  ${C_DIM}port ${L_PORT[i]}: mode \"SSH${tlsnote:- direct}\" — put your payload/proxy in the client${C_RESET}" ;;
             connect) echo -e "  ${C_DIM}port ${L_PORT[i]}: HTTP proxy = this host:${L_PORT[i]}${tlsnote}${C_RESET}" ;;
             payload) echo -e "  ${C_DIM}port ${L_PORT[i]}: send your payload to this host:${L_PORT[i]}${tlsnote}${C_RESET}" ;;
             auto)    echo -e "  ${C_DIM}port ${L_PORT[i]}: payload, HTTP proxy or plain SSH all work${tlsnote}${C_RESET}" ;;
@@ -272,12 +279,14 @@ setup() {
         echo -e "${C_BOLD}${C_PURPLE}=== Tunnel setup ===${C_RESET}\n"
         show_listeners
         echo
-        echo -e "  ${C_GREEN}[1]${C_RESET} SSH + SSL/TLS ${C_DIM}(direct, TLS only)${C_RESET}"
-        echo -e "  ${C_GREEN}[2]${C_RESET} HTTP proxy ${C_DIM}(CONNECT)${C_RESET}"
-        echo -e "  ${C_GREEN}[3]${C_RESET} Client payload"
+        echo -e "${C_DIM}  Where the payload goes decides the mode. If the client sends its payload${C_RESET}"
+        echo -e "${C_DIM}  to its own proxy, that proxy eats it and we only ever see TLS -> pick [1].${C_RESET}\n"
+        echo -e "  ${C_GREEN}[1]${C_RESET} SSH + SSL/TLS ${C_DIM}— works behind the client's own proxy/payload (usual choice)${C_RESET}"
+        echo -e "  ${C_GREEN}[2]${C_RESET} We act as the HTTP proxy ${C_DIM}— client sends CONNECT to us${C_RESET}"
+        echo -e "  ${C_GREEN}[3]${C_RESET} Payload sent to us ${C_DIM}— no proxy in between${C_RESET}"
         echo -e "  ${C_GREEN}[4]${C_RESET} Accept any of the above ${C_DIM}(auto-detect)${C_RESET}"
         echo
-        echo -e "  ${C_CYAN}[p]${C_RESET} Preset: TLS on 443, proxy on 8888, payload on 2053"
+        echo -e "  ${C_CYAN}[p]${C_RESET} Preset: TLS on 443 only ${C_DIM}(for clients using their own proxy)${C_RESET}"
         echo -e "  ${C_YELLOW}[r]${C_RESET} Remove a listener"
         echo -e "  ${C_BOLD}[d]${C_RESET} Done — review and save"
         echo -e "  ${C_RED}[q]${C_RESET} Cancel"
@@ -292,9 +301,9 @@ setup() {
             2) add_listener connect 8888 0 ;;
             3) add_listener payload 2053 0 ;;
             4) add_listener auto 8443 0 ;;
-            p) L_PORT=(443 8888 2053); L_MODE=(direct connect payload); L_TLS=(1 0 0)
-               choose_certificate && ask_payload_options
-               echo -e "${C_GREEN}  ✓ preset loaded${C_RESET}" ;;
+            p) L_PORT=(443); L_MODE=(direct); L_TLS=(1)
+               choose_certificate \
+                   && echo -e "${C_GREEN}  ✓ preset loaded: SSH + SSL/TLS on 443${C_RESET}" ;;
             r) if [ "${#L_PORT[@]}" -eq 0 ]; then echo -e "${C_YELLOW}  ! nothing to remove${C_RESET}"; else
                    local n; ask n "Number to remove" ""
                    if [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le "${#L_PORT[@]}" ]; then
