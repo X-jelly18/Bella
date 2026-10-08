@@ -1,0 +1,295 @@
+# Ayanakoji SSH tunnel
+
+SSH tunnelling for a Debian or Ubuntu VPS. A Go proxy terminates TLS and relays
+the stream to local sshd.
+
+## The usual setup: the client brings its own proxy and payload
+
+```
+client ──payload + CONNECT──> client's own proxy ──TCP──> our server :443 ──> sshd
+                                                              │
+                                                      TLS starts here,
+                                                      end to end with us
+```
+
+The client's app sends its payload to **its own** proxy — an ISP proxy, a
+corporate proxy, whatever it has. That proxy consumes the payload and the
+`CONNECT`, opens a plain TCP tunnel to us, and the app then negotiates TLS with
+*our* server through it and runs SSH inside.
+
+So the server never sees the payload. All it needs is:
+
+```
+-listen 443:direct:tls -cert … -key …
+```
+
+which is menu option **[1]**, or the **[p]** preset.
+
+**Use port 443.** Most ISP and corporate proxies only allow `CONNECT` to 443 and
+answer `403 Forbidden` for anything else, so a TLS listener on a high port is
+unreachable through them.
+
+The payload itself lives entirely in the client — the server has no say in it.
+TCP keepalive is on at 15s intervals, which matters here because intermediate
+proxies drop idle tunnels.
+
+## Other topologies
+
+If a client has no proxy of its own and talks to us directly, these modes handle
+the handshake server-side. Each port is configured independently:
+
+| Mode | Client sends | Server replies |
+|---|---|---|
+| `direct` | nothing — raw SSH straight away | nothing |
+| `connect` | `CONNECT host:port HTTP/1.1` | `200 Connection established` |
+| `payload` | any HTTP request head | configurable status line, or nothing |
+| `auto` | any of the above | sniffs the first bytes and matches |
+
+A **path** can be required on `payload` and `auto` ports with `-path /ssh`,
+reproducing what the old HAProxy frontend matched on. Requests to any other path
+get `404 Not Found`, so a scanner sees an ordinary web server.
+
+Adding `:tls` terminates TLS on that port and runs the handshake **inside** the
+TLS session, which is what clients offer as *SSL + payload* and *SSL + proxy*:
+
+```
+443:direct:tls    SSH + SSL/TLS  (works behind the client's own proxy)
+8888:connect      we are the client's HTTP proxy
+2053:payload      client sends its payload to us, no proxy between
+8443:auto:tls     any of the three, inside TLS
+```
+
+A bare port list (`-listen 443`) means `direct:tls`. TLS 1.2 is the floor.
+
+In `connect` mode the host:port the client asks for is **ignored** — every
+tunnel goes to the configured SSH backend. Honouring arbitrary targets would
+make this an open relay.
+
+## OpenVPN behind the same handshakes
+
+OpenVPN has no notion of an HTTP payload or a `CONNECT` request, so it cannot
+get through a filter that wants one. The proxy does that handshake on its behalf
+and then relays the stream to an OpenVPN server:
+
+```
+client ──payload / CONNECT / TLS──> proxy :443 ──plain TCP──> openvpn :1194
+```
+
+Append `@ovpn` to any listener to point it at OpenVPN instead of sshd, or
+`@auto` to route each connection by what it turns out to be:
+
+```
+-listen 443:payload:tls@ovpn      payload, then TLS, then OpenVPN
+-listen 8443:payload:tls@auto     the same port serves SSH and OpenVPN clients
+-listen 1194:direct@ovpn          plain OpenVPN passthrough, no handshake
+-listen 8888:connect@ovpn         client uses us as an HTTP proxy, reaches OpenVPN
+```
+
+With no suffix a listener goes to SSH, so existing configurations are unchanged.
+`-ovpn-host` and `-ovpn-port` set the backend (default `127.0.0.1:1194`).
+
+### OpenVPN must be in TCP mode
+
+This is the one thing that will silently not work. The proxy relays a TCP
+stream, so a UDP-only OpenVPN server cannot be reached through it. In the server
+config:
+
+```
+proto tcp-server
+port 1194
+```
+
+and in the client's `.ovpn`:
+
+```
+proto tcp
+remote your-server 443
+```
+
+Bear in mind OpenVPN inside TLS inside TCP means TCP carrying TCP, which handles
+loss worse than OpenVPN's own UDP mode. It is the price of getting through a
+filter, not a speed-up.
+
+### How `@auto` tells them apart
+
+Over TCP, OpenVPN frames every packet with a two-byte big-endian length followed
+by a byte whose top five bits are the opcode (`P_OPCODE_SHIFT 3` in the OpenVPN
+source), and a client's first packet is always a hard reset: opcode 1, 7 or 10
+(`P_CONTROL_HARD_RESET_CLIENT_V1`, `_V2`, `_V3`). An SSH banner cannot be
+mistaken for one, because `SS` read as a length is far larger than any control
+packet. A TLS ClientHello, an HTTP request and random bytes are all likewise
+rejected and routed to SSH.
+
+A client that sends nothing for 1.5s is taken to be SSH, since an OpenVPN client
+always speaks first. Explicit `@ssh` or `@ovpn` does no sniffing at all, so
+prefer it when a port only ever carries one protocol.
+
+### This does not install OpenVPN
+
+The menu points the proxy at an OpenVPN server; it does not set one up. Install
+and key generation (easy-rsa, certificates, `server.conf`, routing and NAT) are
+separate work.
+
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/X-jelly18/Bella/main/vps/install.sh | sudo bash
+```
+
+Installs `openssl` and a Go toolchain, builds the proxy, and opens the setup
+menu.
+
+Piping a remote script into a root shell runs whatever that URL serves at that
+moment. To read it first:
+
+```sh
+curl -fsSL -o install.sh https://raw.githubusercontent.com/X-jelly18/Bella/main/vps/install.sh
+less install.sh
+sudo bash install.sh
+```
+
+| Variable | Effect |
+|---|---|
+| `REF` | branch, tag or commit to install from (default `main`) |
+| `REPO` | `owner/name` to install from a fork |
+| `INSTALL_DIR` | install location (default `/opt/ayanakoji-proxy`) |
+| `NONINTERACTIVE=1` | install only, do not open the menu |
+| `SKIP_DEPS=1` | skip apt and Go setup, for re-runs |
+
+Needs Go 1.21+. If the distro package is older, the official toolchain is
+fetched into `/usr/local/go`.
+
+## Setup
+
+```sh
+sudo /opt/ayanakoji-proxy/menu.sh
+```
+
+Option **[1]** builds the listener list through prompts — pick a mode, give it a
+port, say whether to wrap it in TLS — then asks for the certificate and SSH
+backend, shows the resulting command, and writes the systemd unit. `[p]` loads a
+preset of TLS on 443, proxy on 8888 and payload on 2053.
+
+Certificates are either generated self-signed (most tunnel clients skip
+verification) or taken from an existing pair. Certbot renewal needs a hook:
+
+```sh
+echo 'systemctl restart ayanakoji-proxy' | sudo tee /etc/letsencrypt/renewal-hooks/deploy/ayanakoji.sh
+sudo chmod +x /etc/letsencrypt/renewal-hooks/deploy/ayanakoji.sh
+```
+
+## Connecting
+
+**Client has its own proxy** (the usual case): in the tunnel app set the proxy to
+the client's proxy, put the payload in the app's payload field, set the remote
+host to this server and the port to 443, and choose the SSL/TLS mode. The app
+sends the payload to its proxy, then does TLS with us.
+
+**No proxy in between:** point the app at this server on 443 in *SSH + SSL/TLS*
+mode. From OpenSSH:
+
+```sh
+ssh -o ProxyCommand='openssl s_client -quiet -verify_quiet -connect %h:443' user@your-server
+```
+
+Through an HTTP proxy, with OpenSSH doing the CONNECT itself:
+
+```sh
+ssh -o ProxyCommand='socat - PROXY:their-proxy:your-server:443,proxyport=8080' user@your-server
+```
+
+**Using us as the proxy** (a `connect` port):
+
+```sh
+ssh -o ProxyCommand='socat - PROXY:your-server:127.0.0.1:22,proxyport=8888' user@your-server
+```
+
+### Custom TLS port and path
+
+A TLS listener on a port of your choosing, gated on a path:
+
+```sh
+ayanakoji_proxy -listen 8443:payload:tls -path /ayanakoji \
+    -cert /etc/ayanakoji/cert.pem -key /etc/ayanakoji/key.pem
+```
+
+The client then connects with TLS to port 8443 and sends a payload whose request
+line targets `/ayanakoji`. The menu asks for both under option **[3]**.
+
+Path matching accepts the path itself and anything below it, so `/ayanakoji`
+also allows `/ayanakoji/token123`, which is what clients appending a token or
+cache-buster send. A query string is ignored, and the absolute form
+(`GET http://host/ayanakoji HTTP/1.1`) that proxied clients send is understood.
+`/ayanakojiXX` and `/other/ayanakoji` are **not** accepted.
+
+Two caveats:
+
+* On an `auto` port the path only gates payload requests. `CONNECT` and raw SSH
+  carry no path and reach the tunnel regardless, so use a `payload` port if the
+  path must be mandatory.
+* A custom port is only reachable through an intermediate proxy if that proxy
+  permits `CONNECT` to it. Most allow 443 only. If clients come via their own
+  proxy, keep a TLS listener on 443.
+
+### Payload notes (only for `payload` / `auto` ports)
+
+These apply when the client sends its payload **to us**. If the payload goes to
+the client's own proxy instead, none of these matter.
+
+The default reply is `200 <font color='red'>@Official_Kiyotaka</font>`, which
+tunnel clients render coloured in their connection log. `-connect-status` sets
+the same banner for CONNECT clients. Both reject CR and LF so a status line
+cannot smuggle in extra headers.
+
+`-payload-status` sets the reply (`200 OK` by default; empty replies nothing).
+`-payload-match` requires a substring in the request head, which quietly drops
+port scanners.
+
+If your client sends a **split payload** — two request blocks rather than one —
+set `-payload-extra-heads 1`. Without it the second block is forwarded to sshd
+as protocol garbage and the connection fails.
+
+## Proxy flags
+
+```
+-listen                  PORTS:MODE[:tls][@ssh|@ovpn|@auto], repeatable
+                         (default 443:direct:tls@ssh)
+-cert, -key              certificate chain and key, required by any :tls listener
+-host                    bind address (default 0.0.0.0)
+-ssh-host, -ssh-port     SSH backend (default 127.0.0.1:22)
+-ovpn-host, -ovpn-port   OpenVPN backend, TCP only (default 127.0.0.1:1194)
+-connect-timeout-secs    backend dial timeout (default 5)
+-handshake-timeout-secs  per-client handshake budget (default 10)
+-payload-status          payload reply banner (default "200 <font color='red'>@Official_Kiyotaka</font>")
+-connect-status          CONNECT reply banner (same default)
+-payload-match           required substring in a payload request head
+-path                    comma-separated paths a payload request must target
+-payload-extra-heads     extra request blocks to consume (default 0)
+-max-conns               concurrent tunnel cap (0 = unlimited)
+-shutdown-grace-secs     drain window on SIGTERM (default 10)
+```
+
+A bare port list (`-listen 443`) means `direct:tls`, so units written for the
+TLS-only version keep working. TLS 1.2 is the floor.
+
+In `connect` mode the host:port the client asks for is **ignored** — every
+tunnel goes to the configured SSH backend. Honouring arbitrary targets would
+make this an open relay and get the server's address blocklisted.
+
+## Hardening worth doing
+
+Once tunnels work, sshd no longer needs to be reachable from the internet. Set
+`ListenAddress 127.0.0.1` in `/etc/ssh/sshd_config` and drop inbound 22 at the
+firewall; the proxy reaches sshd over loopback, so clients are unaffected.
+
+Tunnel accounts created from the menu get `/usr/sbin/nologin` and an expiry
+date, so a leaked password grants a tunnel rather than a shell.
+
+## Uninstall
+
+```sh
+sudo /opt/ayanakoji-proxy/uninstall.sh
+```
+
+Requires typing `yes`, asks separately before deleting certificates, and leaves
+SSH accounts and sshd alone.
