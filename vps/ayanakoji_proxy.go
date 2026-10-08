@@ -8,6 +8,11 @@
 //	payload  read the client's request head, reply a configurable status line
 //	auto     sniff the first bytes and pick connect, direct or payload
 //
+// Appending @ssh, @ovpn or @auto picks the backend the tunnel is handed to, so
+// a handshake mode OpenVPN cannot speak for itself still reaches an OpenVPN
+// server. @auto reads the first bytes of the tunnelled stream and routes SSH
+// and OpenVPN clients on one port.
+//
 // Appending :tls terminates TLS on that port, and the handshake above then
 // happens inside the TLS session. That composition is what tunnel clients call
 // "SSL + payload" or "SSL + proxy":
@@ -64,21 +69,37 @@ const (
 	modeAuto    mode = "auto"
 )
 
+// target names the backend a listener hands its tunnels to.
+type target string
+
+const (
+	targetSSH  target = "ssh"
+	targetOVPN target = "ovpn"
+	targetAuto target = "auto"
+)
+
+// How long a client on an @auto port has to reveal which protocol it speaks.
+// Both OpenVPN and OpenSSH clients send first, so this only bites a client that
+// stays silent, which then falls back to SSH.
+const targetSniffTimeout = 1500 * time.Millisecond
+
 type listener struct {
 	port   string
 	mode   mode
 	useTLS bool
+	target target
 }
 
 func (l listener) String() string {
 	if l.useTLS {
-		return fmt.Sprintf(":%s %s over tls", l.port, l.mode)
+		return fmt.Sprintf(":%s %s over tls -> %s", l.port, l.mode, l.target)
 	}
-	return fmt.Sprintf(":%s %s", l.port, l.mode)
+	return fmt.Sprintf(":%s %s -> %s", l.port, l.mode, l.target)
 }
 
 type config struct {
-	backend          string
+	sshBackend       string
+	ovpnBackend      string
 	connectTimeout   time.Duration
 	handshakeTimeout time.Duration
 	payloadResponse  []byte
@@ -101,13 +122,15 @@ func main() {
 	log.SetFlags(log.LstdFlags)
 
 	var listenArgs repeatedFlag
-	flag.Var(&listenArgs, "listen", "PORTS:MODE[:tls], repeatable (default 443:direct:tls)")
+	flag.Var(&listenArgs, "listen", "PORTS:MODE[:tls][@ssh|@ovpn|@auto], repeatable (default 443:direct:tls@ssh)")
 
 	hostArg := flag.String("host", "0.0.0.0", "Address to bind")
 	certArg := flag.String("cert", "", "TLS certificate chain, required by any :tls listener")
 	keyArg := flag.String("key", "", "TLS private key, required by any :tls listener")
 	sshHostArg := flag.String("ssh-host", "127.0.0.1", "Upstream SSH host")
 	sshPortArg := flag.String("ssh-port", "22", "Upstream SSH port")
+	ovpnHostArg := flag.String("ovpn-host", "127.0.0.1", "Upstream OpenVPN host")
+	ovpnPortArg := flag.String("ovpn-port", "1194", "Upstream OpenVPN port (must be a TCP listener)")
 	connTimeoutArg := flag.Int("connect-timeout-secs", 5, "Seconds to wait for the SSH backend")
 	handshakeTimeoutArg := flag.Int("handshake-timeout-secs", 10, "Seconds a client has to finish its handshake")
 	maxConnsArg := flag.Int("max-conns", 0, "Maximum concurrent tunnels (0 = unlimited)")
@@ -169,7 +192,8 @@ func main() {
 	}
 
 	cfg := &config{
-		backend:          net.JoinHostPort(*sshHostArg, *sshPortArg),
+		sshBackend:       net.JoinHostPort(*sshHostArg, *sshPortArg),
+		ovpnBackend:      net.JoinHostPort(*ovpnHostArg, *ovpnPortArg),
 		connectTimeout:   time.Duration(*connTimeoutArg) * time.Second,
 		handshakeTimeout: time.Duration(*handshakeTimeoutArg) * time.Second,
 		payloadResponse:  payloadResponse,
@@ -202,7 +226,7 @@ func main() {
 	for i, l := range listeners {
 		listenerWG.Add(1)
 		go acceptLoop(sockets[i], l, cfg, sem, &listenerWG, &connWG)
-		log.Printf("listening on %s:%s mode=%s tls=%t -> %s", *hostArg, l.port, l.mode, l.useTLS, cfg.backend)
+		log.Printf("listening on %s:%s mode=%s tls=%t backend=%s", *hostArg, l.port, l.mode, l.useTLS, l.target)
 	}
 
 	sigChan := make(chan os.Signal, 1)
@@ -239,10 +263,26 @@ func parseListeners(args []string) ([]listener, error) {
 	}
 
 	var out []listener
-	for _, raw := range args {
+	for _, rawArg := range args {
+		raw := strings.TrimSpace(rawArg)
+
+		// The backend suffix is taken off before the colon fields are split, so
+		// it cannot be confused with a mode or with "tls".
+		tgt := targetSSH
+		if i := strings.LastIndexByte(raw, '@'); i >= 0 {
+			name := target(strings.ToLower(strings.TrimSpace(raw[i+1:])))
+			switch name {
+			case targetSSH, targetOVPN, targetAuto:
+				tgt = name
+			default:
+				return nil, fmt.Errorf("unknown backend %q in %q (want ssh, ovpn or auto)", raw[i+1:], rawArg)
+			}
+			raw = strings.TrimSpace(raw[:i])
+		}
+
 		fields := strings.Split(raw, ":")
 		if len(fields) > 3 {
-			return nil, fmt.Errorf("expected PORTS:MODE[:tls], got %q", raw)
+			return nil, fmt.Errorf("expected PORTS:MODE[:tls][@BACKEND], got %q", rawArg)
 		}
 
 		m := modeDirect
@@ -252,12 +292,12 @@ func parseListeners(args []string) ([]listener, error) {
 			switch m {
 			case modeDirect, modeConnect, modePayload, modeAuto:
 			default:
-				return nil, fmt.Errorf("unknown mode %q in %q (want direct, connect, payload or auto)", fields[1], raw)
+				return nil, fmt.Errorf("unknown mode %q in %q (want direct, connect, payload or auto)", fields[1], rawArg)
 			}
 		}
 		if len(fields) == 3 {
 			if !strings.EqualFold(strings.TrimSpace(fields[2]), "tls") {
-				return nil, fmt.Errorf("third field of %q must be \"tls\", got %q", raw, fields[2])
+				return nil, fmt.Errorf("third field of %q must be \"tls\", got %q", rawArg, fields[2])
 			}
 			useTLS = true
 		}
@@ -271,7 +311,7 @@ func parseListeners(args []string) ([]listener, error) {
 			if err != nil || n < 1 || n > 65535 {
 				return nil, fmt.Errorf("invalid port %q", port)
 			}
-			out = append(out, listener{port: port, mode: m, useTLS: useTLS})
+			out = append(out, listener{port: port, mode: m, useTLS: useTLS, target: tgt})
 		}
 	}
 
@@ -453,11 +493,17 @@ func handleClient(client net.Conn, l listener, cfg *config) {
 	}
 
 	// Anything the client sends after its handshake and before the relay starts
-	// is buffered in this reader, so it has to be the relay's source. Direct
-	// mode skips it entirely and keeps the kernel copy fast path.
+	// is buffered in this reader, so it has to be the relay's source. A direct
+	// port with a fixed backend needs no reader at all and keeps the kernel copy
+	// fast path.
 	var clientSrc io.Reader = client
+	var reader *bufio.Reader
+	if l.mode != modeDirect || l.target == targetAuto {
+		reader = bufio.NewReaderSize(client, relayBufferSize)
+		clientSrc = reader
+	}
+
 	if l.mode != modeDirect {
-		reader := bufio.NewReaderSize(client, relayBufferSize)
 		if err := client.SetReadDeadline(time.Now().Add(cfg.handshakeTimeout)); err != nil {
 			return
 		}
@@ -469,12 +515,26 @@ func handleClient(client net.Conn, l listener, cfg *config) {
 		if err := client.SetReadDeadline(time.Time{}); err != nil {
 			return
 		}
-		clientSrc = reader
 	}
 
-	upstream, err := net.DialTimeout("tcp", cfg.backend, cfg.connectTimeout)
+	backend := cfg.sshBackend
+	resolved := l.target
+	if resolved == targetAuto {
+		if err := client.SetReadDeadline(time.Now().Add(targetSniffTimeout)); err != nil {
+			return
+		}
+		resolved = sniffTarget(reader)
+		if err := client.SetReadDeadline(time.Time{}); err != nil {
+			return
+		}
+	}
+	if resolved == targetOVPN {
+		backend = cfg.ovpnBackend
+	}
+
+	upstream, err := net.DialTimeout("tcp", backend, cfg.connectTimeout)
 	if err != nil {
-		log.Printf("[:%s] dialling backend %s failed: %v", l.port, cfg.backend, err)
+		log.Printf("[:%s] dialling %s backend %s failed: %v", l.port, resolved, backend, err)
 		return
 	}
 	defer upstream.Close()
@@ -544,6 +604,41 @@ func handshake(client net.Conn, reader *bufio.Reader, m mode, cfg *config) error
 	return fmt.Errorf("unhandled mode %q", m)
 }
 
+// sniffTarget decides which backend a tunnelled stream belongs to by looking at
+// its first bytes. A client that sends nothing within the sniff window is taken
+// to be SSH, because an OpenVPN client always speaks first.
+func sniffTarget(reader *bufio.Reader) target {
+	prefix, _ := reader.Peek(4)
+	switch {
+	case len(prefix) >= 4 && strings.EqualFold(string(prefix[:4]), "SSH-"):
+		return targetSSH
+	case looksLikeOpenVPN(prefix):
+		return targetOVPN
+	default:
+		return targetSSH
+	}
+}
+
+// looksLikeOpenVPN reports whether these bytes open an OpenVPN TCP session.
+// Over TCP every OpenVPN packet is framed with a two-byte big-endian length,
+// followed by a byte whose top five bits are the opcode; a client's first
+// packet is always one of the hard-reset opcodes. An SSH banner cannot collide,
+// because "SS" read as a length is far larger than any control packet.
+func looksLikeOpenVPN(b []byte) bool {
+	if len(b) < 3 {
+		return false
+	}
+	length := int(b[0])<<8 | int(b[1])
+	if length < 1 || length > 1600 {
+		return false
+	}
+	switch b[2] >> 3 {
+	case 1, 7, 10: // P_CONTROL_HARD_RESET_CLIENT_V1, V2, V3
+		return true
+	}
+	return false
+}
+
 // sniff inspects the first bytes to decide how a client on an auto port wants
 // to be greeted.
 func sniff(reader *bufio.Reader) (mode, error) {
@@ -575,7 +670,7 @@ func hasFoldPrefix(b []byte, prefix string) bool {
 // handshakeConnect implements the server half of an HTTP CONNECT proxy.
 //
 // The host:port the client asks for is deliberately ignored: every tunnel is
-// relayed to the configured SSH backend. Honouring arbitrary targets would turn
+// relayed to the listener's configured backend. Honouring arbitrary targets would turn
 // this into an open relay and get the server's address blocklisted.
 func handshakeConnect(client net.Conn, reader *bufio.Reader, response []byte) error {
 	head, err := readRequestHead(reader)

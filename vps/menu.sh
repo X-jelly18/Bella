@@ -40,12 +40,21 @@ ask_yn() {
     done
 }
 
-L_PORT=(); L_MODE=(); L_TLS=()
+L_PORT=(); L_MODE=(); L_TLS=(); L_TARGET=()
+OVPN_HOST="127.0.0.1"; OVPN_PORT="1194"; OVPN_ASKED=0
 CERT=""; KEY=""
 DEFAULT_STATUS="200 <font color='red'>@Official_Kiyotaka</font>"
 PAYLOAD_STATUS="$DEFAULT_STATUS"; PAYLOAD_MATCH=""; EXTRA_HEADS="0"; TUNNEL_PATH=""
 PAYLOAD_ASKED=0
 SSH_HOST="127.0.0.1"; SSH_PORT="22"; MAX_CONNS="0"
+
+target_label() {
+    case "$1" in
+        ssh) echo "SSH" ;;
+        ovpn) echo "OpenVPN" ;;
+        auto) echo "SSH or OpenVPN" ;;
+    esac
+}
 
 mode_label() {
     case "$1" in
@@ -135,10 +144,35 @@ add_listener() {
     if [ "$tls" = "1" ] && [ -z "$CERT" ]; then
         choose_certificate || return 1
     fi
+
+    local tgt bchoice
+    echo
+    echo -e "  ${C_BOLD}Which backend should this port hand tunnels to?${C_RESET}"
+    echo -e "  ${C_GREEN}[1]${C_RESET} SSH"
+    echo -e "  ${C_GREEN}[2]${C_RESET} OpenVPN ${C_DIM}— OpenVPN cannot speak a payload or CONNECT itself, so the${C_RESET}"
+    echo -e "      ${C_DIM}proxy does the handshake and then relays to it${C_RESET}"
+    echo -e "  ${C_GREEN}[3]${C_RESET} Either ${C_DIM}— detect per connection from the first bytes${C_RESET}"
+    ask bchoice "Backend" "1"
+    case "$bchoice" in
+        2) tgt=ovpn ;;
+        3) tgt=auto ;;
+        *) tgt=ssh ;;
+    esac
+
+    if [ "$tgt" != "ssh" ] && [ "$OVPN_ASKED" = "0" ]; then
+        OVPN_ASKED=1
+        echo
+        echo -e "${C_YELLOW}  ! OpenVPN must be listening on TCP. The proxy relays a TCP stream, so a${C_RESET}"
+        echo -e "${C_YELLOW}    UDP-only OpenVPN server cannot be reached this way. Put${C_RESET}"
+        echo -e "${C_YELLOW}    \"proto tcp-server\" in the server config and \"proto tcp\" in the client's.${C_RESET}"
+        ask OVPN_HOST "OpenVPN host" "$OVPN_HOST"
+        ask OVPN_PORT "OpenVPN TCP port" "$OVPN_PORT"
+    fi
+
     case "$m" in payload | auto) ask_payload_options ;; esac
 
-    L_PORT+=("$port"); L_MODE+=("$m"); L_TLS+=("$tls")
-    echo -e "${C_GREEN}  ✓ added $(mode_label "$m") on port $port$([ "$tls" = "1" ] && echo " over TLS")${C_RESET}"
+    L_PORT+=("$port"); L_MODE+=("$m"); L_TLS+=("$tls"); L_TARGET+=("$tgt")
+    echo -e "${C_GREEN}  ✓ added $(mode_label "$m") on port $port$([ "$tls" = "1" ] && echo " over TLS") -> $(target_label "$tgt")${C_RESET}"
     if [ "$tls" = "1" ] && [ "$port" != "443" ]; then
         echo -e "${C_YELLOW}  ! Most ISP and corporate proxies only allow CONNECT to 443, and answer${C_RESET}"
         echo -e "${C_YELLOW}    403 for anything else. If clients reach this server through their own${C_RESET}"
@@ -186,8 +220,9 @@ show_listeners() {
     local i note
     for ((i = 0; i < ${#L_PORT[@]}; i++)); do
         [ "${L_TLS[i]}" = "1" ] && note=" ${C_CYAN}+SSL/TLS${C_RESET}" || note=""
-        printf "  ${C_GREEN}%2d.${C_RESET} port ${C_BOLD}%-6s${C_RESET} %-26s%b\n" \
-            "$((i + 1))" "${L_PORT[i]}" "$(mode_label "${L_MODE[i]}")" "$note"
+        printf "  ${C_GREEN}%2d.${C_RESET} port ${C_BOLD}%-6s${C_RESET} %-26s %-15s%b\n" \
+            "$((i + 1))" "${L_PORT[i]}" "$(mode_label "${L_MODE[i]}")" \
+            "-> $(target_label "${L_TARGET[i]}")" "$note"
     done
 }
 
@@ -197,9 +232,11 @@ build_args() {
     for ((i = 0; i < ${#L_PORT[@]}; i++)); do
         spec="${L_PORT[i]}:${L_MODE[i]}"
         [ "${L_TLS[i]}" = "1" ] && spec="$spec:tls"
+        [ "${L_TARGET[i]}" != "ssh" ] && spec="$spec@${L_TARGET[i]}"
         out+=(-listen "$spec")
     done
     out+=(-ssh-host "$SSH_HOST" -ssh-port "$SSH_PORT")
+    needs_ovpn && out+=(-ovpn-host "$OVPN_HOST" -ovpn-port "$OVPN_PORT")
     [ -n "$CERT" ] && out+=(-cert "$CERT" -key "$KEY")
     if needs_payload; then
         out+=(-payload-status "$PAYLOAD_STATUS")
@@ -209,6 +246,14 @@ build_args() {
     fi
     [ "$MAX_CONNS" != "0" ] && out+=(-max-conns "$MAX_CONNS")
     return 0
+}
+
+needs_ovpn() {
+    local i
+    for ((i = 0; i < ${#L_TARGET[@]}; i++)); do
+        case "${L_TARGET[i]}" in ovpn | auto) return 0 ;; esac
+    done
+    return 1
 }
 
 needs_payload() {
@@ -286,7 +331,8 @@ client_hints() {
 }
 
 setup() {
-    L_PORT=(); L_MODE=(); L_TLS=(); CERT=""; KEY=""; PAYLOAD_ASKED=0
+    L_PORT=(); L_MODE=(); L_TLS=(); L_TARGET=()
+OVPN_HOST="127.0.0.1"; OVPN_PORT="1194"; OVPN_ASKED=0; CERT=""; KEY=""; PAYLOAD_ASKED=0
     PAYLOAD_STATUS="$DEFAULT_STATUS"; PAYLOAD_MATCH=""; EXTRA_HEADS="0"; MAX_CONNS="0"; TUNNEL_PATH=""
 
     while true; do
@@ -316,7 +362,7 @@ setup() {
             2) add_listener connect 8888 0 n ;;
             3) add_listener payload 443 0 y ;;
             4) add_listener auto 443 0 y ;;
-            p) L_PORT=(443); L_MODE=(direct); L_TLS=(1)
+            p) L_PORT=(443); L_MODE=(direct); L_TLS=(1); L_TARGET=(ssh)
                choose_certificate \
                    && echo -e "${C_GREEN}  ✓ preset loaded: SSH + SSL/TLS on 443${C_RESET}" ;;
             r) if [ "${#L_PORT[@]}" -eq 0 ]; then echo -e "${C_YELLOW}  ! nothing to remove${C_RESET}"; else
@@ -327,6 +373,7 @@ setup() {
                        L_PORT=("${L_PORT[@]:0:x}" "${L_PORT[@]:$((x + 1))}")
                        L_MODE=("${L_MODE[@]:0:x}" "${L_MODE[@]:$((x + 1))}")
                        L_TLS=("${L_TLS[@]:0:x}" "${L_TLS[@]:$((x + 1))}")
+                       L_TARGET=("${L_TARGET[@]:0:x}" "${L_TARGET[@]:$((x + 1))}")
                    else echo -e "${C_RED}  ✗ no listener numbered '$n'${C_RESET}"; fi
                fi ;;
             d) if [ "${#L_PORT[@]}" -eq 0 ]; then
@@ -347,7 +394,8 @@ setup() {
     build_args args
     echo -e "\n${C_BOLD}${C_PURPLE}=== Review ===${C_RESET}\n"
     show_listeners
-    echo -e "\n  ${C_BOLD}Backend:${C_RESET}  $SSH_HOST:$SSH_PORT"
+    echo -e "\n  ${C_BOLD}SSH:${C_RESET}      $SSH_HOST:$SSH_PORT"
+    needs_ovpn && echo -e "  ${C_BOLD}OpenVPN:${C_RESET}  $OVPN_HOST:$OVPN_PORT ${C_DIM}(must be TCP)${C_RESET}"
     [ -n "$CERT" ] && echo -e "  ${C_BOLD}Cert:${C_RESET}     $CERT"
     [ -n "$CERT" ] && echo -e "  ${C_BOLD}Key:${C_RESET}      $KEY"
     needs_payload && echo -e "  ${C_BOLD}Payload:${C_RESET}  reply \"${PAYLOAD_STATUS:-(nothing)}\"${PAYLOAD_MATCH:+, must contain \"$PAYLOAD_MATCH\"}"
